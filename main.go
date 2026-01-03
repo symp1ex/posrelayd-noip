@@ -2,7 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"sync"
@@ -30,12 +32,19 @@ type Message struct {
 
 	// === AUTH ===
 	Password string `json:"password,omitempty"`
+	ApiKey   string `json:"api_key,omitempty"`
+	TempPass string `json:"temp_pass,omitempty"`
 	Error    string `json:"error,omitempty"`
 }
 
 type AuthState struct {
 	Attempts int
 	Blocked  time.Time
+}
+
+type PasswordEntry struct {
+	TempPass string `json:"temp_pass"`
+	Password any    `json:"password"` // всегда false
 }
 
 var (
@@ -47,22 +56,28 @@ var (
 	clients  = make(map[string]*Peer)
 	globalMu sync.Mutex
 
-	passwords = map[string]string{}
-	authState = map[string]*AuthState{}
+	passwords = make(map[string]*PasswordEntry)
+	authState = make(map[string]*AuthState)
 	authMu    sync.Mutex
 )
 
 func loadPasswords() {
-	data, err := os.ReadFile("passwords.json")
+	data, err := os.ReadFile("clients.json")
 	if err != nil {
-		log.Fatal("passwords.json not found")
+		passwords = make(map[string]*PasswordEntry)
+		return
 	}
 	json.Unmarshal(data, &passwords)
 }
 
 func savePasswords() {
 	data, _ := json.MarshalIndent(passwords, "", "  ")
-	_ = os.WriteFile("passwords.json", data, 0644)
+	_ = os.WriteFile("clients.json", data, 0644)
+}
+
+func generateTempPass() string {
+	rand.Seed(time.Now().UnixNano())
+	return fmt.Sprintf("%05d", rand.Intn(100000))
 }
 
 func wsHandler(w http.ResponseWriter, r *http.Request) {
@@ -91,7 +106,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 		if peer != nil && peer.Role == "client" {
 			globalMu.Lock()
-			
+
 			for _, admin := range admins {
 				admin.Mu.Lock()
 				_ = admin.Conn.WriteJSON(Message{
@@ -122,39 +137,38 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		// ================= AUTH =================
 
 		case "auth":
+
 			authMu.Lock()
-			state := authState[msg.ClientID]
-			if state == nil {
-				state = &AuthState{}
-				authState[msg.ClientID] = state
-			}
+			entry, exists := passwords[msg.ClientID]
 
-			if time.Now().Before(state.Blocked) {
+			if !exists {
 				authMu.Unlock()
 				conn.WriteJSON(Message{
 					Type:  "auth_fail",
-					Error: "Тайм-аут 1 минута",
+					Error: "Unknown client",
 				})
 				continue
 			}
 
-			if passwords[msg.ClientID] != msg.Password {
-				state.Attempts++
-				if state.Attempts >= 3 {
-					state.Blocked = time.Now().Add(time.Minute)
-					state.Attempts = 0
-				}
-				authMu.Unlock()
+			ok := false
 
-				conn.WriteJSON(Message{
-					Type:  "auth_fail",
-					Error: "Неверный логин или пароль",
-				})
-				continue
+			if entry.Password != false && msg.Password == entry.Password {
+				ok = true
 			}
 
-			state.Attempts = 0
+			if entry.TempPass != "" && msg.Password == entry.TempPass {
+				ok = true
+			}
+
 			authMu.Unlock()
+
+			if !ok {
+				conn.WriteJSON(Message{
+					Type:  "auth_fail",
+					Error: "Invalid password",
+				})
+				continue
+			}
 
 			authenticated = true
 			conn.WriteJSON(Message{Type: "auth_ok"})
@@ -202,18 +216,39 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 		case "client_hello":
 
-			authMu.Lock()
-			stored, exists := passwords[msg.ID]
-
-			if !exists {
-				passwords[msg.ID] = msg.Password
-				savePasswords()
-				log.Println("New client registered:", msg.ID)
-			} else if stored != msg.Password {
-				authMu.Unlock()
-				log.Println("Client auth failed:", msg.ID)
+			if msg.ApiKey != "123" {
+				log.Println("Invalid API key from client:", msg.ID)
 				return
 			}
+
+			authMu.Lock()
+
+			entry, exists := passwords[msg.ID]
+			if !exists {
+				entry = &PasswordEntry{
+					Password: false,
+				}
+				passwords[msg.ID] = entry
+			}
+
+			// =========================
+			// PASS-ONLY РЕЖИМ (-pass)
+			// =========================
+			if msg.Password != "" {
+				entry.Password = msg.Password
+				savePasswords()
+				authMu.Unlock()
+
+				log.Println("Password updated via pass-only connection:", msg.ID)
+				return
+			}
+
+			// =========================
+			// ОБЫЧНЫЙ PY-КЛИЕНТ
+			// =========================
+
+			entry.TempPass = generateTempPass()
+			savePasswords()
 
 			authMu.Unlock()
 
@@ -227,17 +262,26 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			clients[peer.ID] = peer
 			globalMu.Unlock()
 
-			log.Println("Client connected:", peer.ID)
+			log.Println(
+				"Client connected:",
+				msg.ID,
+				"temp_pass:", entry.TempPass,
+				"password_set:", entry.Password != false,
+			)
 
-			// === ATTACH ALL CURRENT ADMINS ===
-			globalMu.Lock()
+			// === ОТПРАВЛЯЕМ temp_pass PY-КЛИЕНТУ ===
+			_ = conn.WriteJSON(Message{
+				Type:     "temp_pass",
+				TempPass: entry.TempPass,
+			})
+
+			// === ATTACH ADMINS ===
 			for _, admin := range admins {
 				_ = conn.WriteJSON(Message{
 					Type: "admin_attach",
 					ID:   admin.ID,
 				})
 			}
-			globalMu.Unlock()
 
 		// ================= ROUTING =================
 
