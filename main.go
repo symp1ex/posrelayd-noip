@@ -66,8 +66,12 @@ var (
 
 	adminAttempts   = make(map[string]int)
 	adminAttemptsMu sync.Mutex
-	blacklist       = make(map[string]struct{})
-	blacklistMu     sync.Mutex
+
+	protocolViolations   = make(map[string]int)
+	protocolViolationsMu sync.Mutex
+
+	blacklist   = make(map[string]struct{})
+	blacklistMu sync.Mutex
 )
 
 func loadPasswords() {
@@ -177,25 +181,25 @@ func handleClientAuth(remoteIP string, msg Message, conn *websocket.Conn, entry 
 }
 
 func wsHandler(w http.ResponseWriter, r *http.Request) {
+	remoteIP := strings.Split(r.RemoteAddr, ":")[0]
+
+	// === ПРОВЕРКА BLACKLIST ДО UPGRADE ===
+	blacklistMu.Lock()
+	_, banned := blacklist[remoteIP]
+	blacklistMu.Unlock()
+
+	if banned {
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte("IP_BANNED"))
+		return
+	}
+
+	// === ТОЛЬКО ТЕПЕРЬ UPGRADE ===
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
 	defer conn.Close()
-
-	remoteIP := strings.Split(r.RemoteAddr, ":")[0]
-
-	// Проверка blacklist
-	blacklistMu.Lock()
-	_, banned := blacklist[remoteIP]
-	blacklistMu.Unlock()
-	if banned {
-		_ = conn.WriteJSON(Message{
-			Type:  "error",
-			Error: "Your IP is banned",
-		})
-		return
-	}
 
 	var peer *Peer
 	authenticated := false
@@ -272,6 +276,10 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			delete(adminAttempts, remoteIP)
 			adminAttemptsMu.Unlock()
 
+			protocolViolationsMu.Lock()
+			delete(protocolViolations, remoteIP)
+			protocolViolationsMu.Unlock()
+
 			authenticated = true
 			_ = conn.WriteJSON(Message{
 				Type: "admin_hello_ok",
@@ -297,6 +305,10 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			authenticated = true
+
+			protocolViolationsMu.Lock()
+			delete(protocolViolations, remoteIP)
+			protocolViolationsMu.Unlock()
 
 		// ================= REGISTER =================
 
@@ -486,6 +498,36 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 				})
 				admin.Mu.Unlock()
 			}
+
+		default:
+			protocolViolationsMu.Lock()
+			protocolViolations[remoteIP]++
+			attempts := protocolViolations[remoteIP]
+			protocolViolationsMu.Unlock()
+
+			log.Printf(
+				"Protocol violation from %s: unknown message type '%s' (%d/3)",
+				remoteIP, msg.Type, attempts,
+			)
+
+			if attempts >= 3 {
+				addToBlacklist(remoteIP)
+
+				_ = conn.WriteJSON(Message{
+					Type:  "error",
+					Error: "Your IP is banned due to protocol violations",
+				})
+
+				return
+			}
+
+			_ = conn.WriteJSON(Message{
+				Type: "error",
+				Error: fmt.Sprintf(
+					"Unknown request type '%s' (%d/3)",
+					msg.Type, attempts,
+				),
+			})
 		}
 	}
 }
