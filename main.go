@@ -579,7 +579,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 		// ================= ROUTING =================
 
-		case "command", "interactive_response":
+		case "command", "interactive_response", "control":
 			globalMu.Lock()
 			client := clients[msg.ClientID]
 			globalMu.Unlock()
