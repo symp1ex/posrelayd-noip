@@ -58,6 +58,7 @@ var (
 
 	admins   = make(map[string]*Peer)
 	clients  = make(map[string]*Peer)
+	sessions = make(map[string]string)
 	globalMu sync.Mutex
 
 	passwords    = make(map[string]*PasswordEntry)
@@ -175,7 +176,7 @@ func handleClientAuth(remoteIP string, msg Message, conn *websocket.Conn, entry 
 	}
 
 	ok := false
-	// === проверка паролей ===
+	// проверка паролей
 	if entry.Password != false {
 		if enc, ok2 := entry.Password.(string); ok2 && crypto.Verify(enc, msg.Password) {
 			ok = true
@@ -219,7 +220,7 @@ func handleClientAuth(remoteIP string, msg Message, conn *websocket.Conn, entry 
 func wsHandler(w http.ResponseWriter, r *http.Request) {
 	remoteIP := getClientIP(r)
 
-	// === ПРОВЕРКА BLACKLIST ДО UPGRADE ===
+	// ПРОВЕРКА BLACKLIST ДО UPGRADE
 	blacklistMu.Lock()
 	_, banned := blacklist[remoteIP]
 	blacklistMu.Unlock()
@@ -230,7 +231,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// === ТОЛЬКО ТЕПЕРЬ UPGRADE ===
+	// ТОЛЬКО ТЕПЕРЬ UPGRADE
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
@@ -241,15 +242,25 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	authenticated := false
 
 	defer func() {
-		// === ADMIN DETACH ON DISCONNECT ===
+		// ADMIN DETACH ON DISCONNECT
 		if peer != nil && peer.Role == "admin" {
 			globalMu.Lock()
-			for _, client := range clients {
-				_ = client.Conn.WriteJSON(Message{
-					Type: "admin_detach",
-					ID:   peer.ID,
-				})
+
+			// Получаем clientID, привязанный к этому администратору
+			clientID, ok := sessions[peer.ID]
+			if ok {
+				// Найти объект клиента по clientID
+				client, ok := clients[clientID]
+				if ok {
+					_ = client.Conn.WriteJSON(Message{
+						Type: "admin_detach",
+						ID:   peer.ID,
+					})
+				}
+				// После отправки удалить сессию
+				delete(sessions, peer.ID)
 			}
+			// Удаляем администратора
 			delete(admins, peer.ID)
 			globalMu.Unlock()
 			log.Println("Admin disconnected:", peer.ID)
@@ -258,14 +269,23 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		if peer != nil && peer.Role == "client" {
 			globalMu.Lock()
 
-			for _, admin := range admins {
-				admin.Mu.Lock()
-				_ = admin.Conn.WriteJSON(Message{
-					Type:     "session_closed",
-					ClientID: peer.ID,
-					Error:    "Client disconnected",
-				})
-				admin.Mu.Unlock()
+			for adminID, clientID := range sessions {
+				if clientID == peer.ID {
+					// Найти объект admin по adminID
+					admin, ok := admins[adminID]
+					if !ok {
+						continue // если админа нет, пропускаем
+					}
+
+					admin.Mu.Lock()
+					_ = admin.Conn.WriteJSON(Message{
+						Type:     "session_closed",
+						ClientID: peer.ID,
+						Error:    "Client disconnected",
+					})
+					admin.Mu.Unlock()
+					delete(sessions, adminID)
+				}
 			}
 
 			delete(clients, peer.ID)
@@ -398,15 +418,14 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			authenticated = true
+			sessions[msg.ID] = msg.ClientID // сохраняем, чтобы знать, к какому клиенту привязывать админа
 
 			protocolViolationsMu.Lock()
 			delete(protocolViolations, remoteIP)
 			protocolViolationsMu.Unlock()
 
-		// ================= REGISTER =================
-
+			// ---------------- REGISTER ----------------
 		case "register":
-
 			if msg.Role == "admin" && !authenticated {
 				_ = conn.WriteJSON(Message{
 					Type:  "auth_fail",
@@ -422,25 +441,30 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			globalMu.Lock()
+			admins[peer.ID] = peer
+			client := sessions[msg.ID]
 
-			if peer.Role == "admin" {
-				admins[peer.ID] = peer
-				log.Println("Admin connected:", peer.ID)
-
-				// === ADMIN ATTACH ===
-				for _, client := range clients {
-					_ = client.Conn.WriteJSON(Message{
-						Type: "admin_attach",
-						ID:   peer.ID,
-					})
+			var targetClient *Peer
+			if peer.Role == "admin" && client != "" {
+				var ok bool
+				targetClient, ok = clients[client]
+				if !ok {
+					targetClient = nil
 				}
+			}
+			globalMu.Unlock() // <- освободили мьютекс до WriteJSON
 
+			log.Println("Admin connected:", peer.ID)
+
+			if targetClient != nil {
+				_ = targetClient.Conn.WriteJSON(Message{
+					Type: "admin_attach",
+					ID:   peer.ID,
+				})
 			} else {
 				clients[peer.ID] = peer
 				log.Println("Client connected:", peer.ID)
 			}
-
-			globalMu.Unlock()
 
 		// ================= CLIENT HELLO =================
 
@@ -561,21 +585,13 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 				"password_set:", entry.Password != false,
 			)
 
-			// === ОТПРАВЛЯЕМ temp_pass PY-КЛИЕНТУ ===
+			// ОТПРАВЛЯЕМ temp_pass PY-КЛИЕНТУ
 			_ = conn.WriteJSON(Message{
 				Type:     "temp_pass",
 				TempPass: plainTemp,
 			})
 
 			authenticated = true
-
-			// === ATTACH ADMINS ===
-			for _, admin := range admins {
-				_ = conn.WriteJSON(Message{
-					Type: "admin_attach",
-					ID:   admin.ID,
-				})
-			}
 
 		// ================= ROUTING =================
 
@@ -623,6 +639,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 					Error: "CMD session terminated on client",
 				})
 				admin.Mu.Unlock()
+				delete(sessions, adminID)
 			}
 
 		default:
