@@ -4,3 +4,6 @@
 /*.exe
 /*.txt
 /*.json
+
+# Ignore runtime catalog
+data/

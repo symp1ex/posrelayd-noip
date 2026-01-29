@@ -15,13 +15,16 @@ import (
 	"github.com/gorilla/websocket"
 
 	"posrelayd-noip/crypto"
+	"posrelayd-noip/logger"
 )
 
 type Peer struct {
 	ID   string
 	Role string // "admin" or "client"
 	Conn *websocket.Conn
-	Mu   sync.Mutex
+
+	sendQueue chan Message
+	done      chan struct{}
 }
 
 type Message struct {
@@ -83,6 +86,40 @@ var (
 		"::1":       {},
 	}
 )
+
+func (p *Peer) StartWriter() {
+	go func() {
+		for {
+			select {
+			case msg, ok := <-p.sendQueue:
+				if !ok {
+					return
+				}
+				_ = p.Conn.WriteJSON(msg)
+			case <-p.done:
+				return
+			}
+		}
+	}()
+}
+
+func (p *Peer) Enqueue(msg Message) {
+	select {
+	case p.sendQueue <- msg:
+	case <-p.done:
+		// соединение закрыто — молча игнорируем
+	}
+}
+
+func (p *Peer) Close() {
+	select {
+	case <-p.done:
+		return
+	default:
+		close(p.done)
+		close(p.sendQueue)
+	}
+}
 
 func loadPasswords() {
 	data, err := os.ReadFile("clients.json")
@@ -242,6 +279,9 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	authenticated := false
 
 	defer func() {
+		if peer != nil {
+			peer.Close()
+		}
 		// ADMIN DETACH ON DISCONNECT
 		if peer != nil && peer.Role == "admin" {
 			globalMu.Lock()
@@ -252,7 +292,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 				// Найти объект клиента по clientID
 				client, ok := clients[clientID]
 				if ok {
-					_ = client.Conn.WriteJSON(Message{
+					client.Enqueue(Message{
 						Type: "admin_detach",
 						ID:   peer.ID,
 					})
@@ -276,14 +316,11 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 					if !ok {
 						continue // если админа нет, пропускаем
 					}
-
-					admin.Mu.Lock()
-					_ = admin.Conn.WriteJSON(Message{
+					admin.Enqueue(Message{
 						Type:     "session_closed",
 						ClientID: peer.ID,
 						Error:    "Client disconnected",
 					})
-					admin.Mu.Unlock()
 					delete(sessions, adminID)
 				}
 			}
@@ -435,10 +472,13 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			peer = &Peer{
-				ID:   msg.ID,
-				Role: msg.Role,
-				Conn: conn,
+				ID:        msg.ID,
+				Role:      msg.Role,
+				Conn:      conn,
+				sendQueue: make(chan Message, 32),
+				done:      make(chan struct{}),
 			}
+			peer.StartWriter()
 
 			globalMu.Lock()
 			admins[peer.ID] = peer
@@ -457,7 +497,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			log.Println("Admin connected:", peer.ID)
 
 			if targetClient != nil {
-				_ = targetClient.Conn.WriteJSON(Message{
+				targetClient.Enqueue(Message{
 					Type: "admin_attach",
 					ID:   peer.ID,
 				})
@@ -569,20 +609,23 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			authMu.Unlock()
 
 			peer = &Peer{
-				ID:   msg.ID,
-				Role: "client",
-				Conn: conn,
+				ID:        msg.ID,
+				Role:      "client",
+				Conn:      conn,
+				sendQueue: make(chan Message, 32),
+				done:      make(chan struct{}),
 			}
+			peer.StartWriter()
 
 			globalMu.Lock()
 			clients[peer.ID] = peer
 			globalMu.Unlock()
 
-			log.Println(
-				"Client connected:",
+			logger.Websocket.Infof(
+				"Client connected: %s, \"temp_pass:\" %s, \"password_set:\" %v",
 				msg.ID,
-				"temp_pass:", entry.TempPass,
-				"password_set:", entry.Password != false,
+				entry.TempPass,
+				entry.Password != false,
 			)
 
 			// ОТПРАВЛЯЕМ temp_pass PY-КЛИЕНТУ
@@ -601,15 +644,13 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			globalMu.Unlock()
 
 			if client != nil {
-				client.Mu.Lock()
-				_ = client.Conn.WriteJSON(Message{
+				client.Enqueue(Message{
 					Type:      msg.Type,
 					ClientID:  msg.ClientID,
 					CommandID: msg.CommandID,
 					Command:   msg.Command,
-					ID:        msg.ID, // ← admin_id
+					ID:        msg.ID,
 				})
-				client.Mu.Unlock()
 			}
 
 		case "result":
@@ -620,9 +661,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			globalMu.Unlock()
 
 			if admin != nil {
-				admin.Mu.Lock()
-				_ = admin.Conn.WriteJSON(msg)
-				admin.Mu.Unlock()
+				admin.Enqueue(msg)
 			}
 
 		case "session_closed":
@@ -633,12 +672,10 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			globalMu.Unlock()
 
 			if admin != nil {
-				admin.Mu.Lock()
-				_ = admin.Conn.WriteJSON(Message{
+				admin.Enqueue(Message{
 					Type:  "session_closed",
 					Error: "CMD session terminated on client",
 				})
-				admin.Mu.Unlock()
 				delete(sessions, adminID)
 			}
 
@@ -679,7 +716,9 @@ func main() {
 	loadPasswords()
 	loadBlacklist()
 
+	port := 22233
+
 	http.HandleFunc("/ws", wsHandler)
-	log.Println("Server listening on :22233")
-	http.ListenAndServe(":22233", nil)
+	logger.Websocket.Infof("Server listening on '%d'", port)
+	http.ListenAndServe(fmt.Sprintf(":%d", port), nil)
 }
