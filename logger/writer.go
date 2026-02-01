@@ -6,12 +6,14 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"posrelayd-noip/config"
 )
 
-const (
+var (
 	logDir     = "data/logs"
-	retainDays = 5
-	logLevel   = "debug"
+	retainDays = config.Cfg.Logs.StoreDays
+	logLevel   = config.Cfg.Logs.LogLevel
 )
 
 type RotatingWriter struct {

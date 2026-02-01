@@ -13,6 +13,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"posrelayd-noip/config"
 	"posrelayd-noip/crypto"
 	"posrelayd-noip/logger"
 )
@@ -629,7 +630,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 		switch msg.Type {
 		case "admin_hello":
-			if msg.ApiKey != "b5679e9e-b5b5-4eaf-bb99-83dba95f9f53" {
+			if msg.ApiKey != config.Cfg.Service.APIKey {
 
 				adminAttemptsMu.Lock()
 				adminAttempts[remoteIP]++
@@ -791,7 +792,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 		case "client_hello":
 
-			if msg.ApiKey != "b5679e9e-b5b5-4eaf-bb99-83dba95f9f53" {
+			if msg.ApiKey != config.Cfg.Service.APIKey {
 				clientAttemptsMu.Lock()
 				clientAttempts[remoteIP]++
 				attempts := clientAttempts[remoteIP]
@@ -1031,7 +1032,7 @@ func main() {
 	loadPasswords()
 	loadBlacklist()
 
-	port := 22233
+	port := config.Cfg.Service.Port
 
 	http.HandleFunc("/ws", wsHandler)
 	logger.Websocket.Infof("Server listening on '%d'", port)
