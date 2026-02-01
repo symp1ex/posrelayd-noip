@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"math/rand"
 	"net"
 	"net/http"
@@ -104,27 +103,57 @@ var (
 
 func (p *Peer) StartWriter() {
 	go func() {
+		logger.Websocket.Debugf(
+			"StartWriter started for peer=%s role=%s",
+			p.ID, p.Role,
+		)
 		for {
 			select {
 			case out, ok := <-p.sendQueue:
 				if !ok {
+					logger.Websocket.Debugf(
+						"StartWriter exiting: sendQueue closed (peer=%s)",
+						p.ID,
+					)
 					return
 				}
 
 				switch out.Kind {
 				case OutboundJSON:
 					if out.JSON != nil {
-						_ = p.Conn.WriteJSON(out.JSON)
+						if err := p.Conn.WriteJSON(out.JSON); err != nil {
+							logger.Websocket.Warnf(
+								"WriteJSON failed (peer=%s type=%s): %v",
+								p.ID,
+								out.JSON.Type,
+								err,
+							)
+							return
+						}
+
+						logger.Websocket.Debugf(
+							"JSON message sent (peer=%s type=%s)",
+							p.ID,
+							out.JSON.Type,
+						)
 					}
 
 				case OutboundPing:
-					_ = p.Conn.WriteMessage(
-						websocket.PingMessage,
-						out.Ping,
-					)
+					if err := p.Conn.WriteMessage(websocket.PingMessage, out.Ping); err != nil {
+						logger.Websocket.Warnf(
+							"Ping failed (peer=%s): %v",
+							p.ID,
+							err,
+						)
+						return
+					}
 				}
 
 			case <-p.done:
+				logger.Websocket.Debugf(
+					"StartWriter stopped by done signal (peer=%s)",
+					p.ID,
+				)
 				return
 			}
 		}
@@ -132,20 +161,37 @@ func (p *Peer) StartWriter() {
 }
 
 func (p *Peer) Enqueue(msg Message) {
+	logger.Websocket.Debugf(
+		"Message enqueued (peer=%s type=%s)",
+		p.ID, msg.Type,
+	)
+
 	select {
 	case p.sendQueue <- OutboundMessage{
 		Kind: OutboundJSON,
 		JSON: &msg,
 	}:
 	case <-p.done:
+		logger.Websocket.Warnf(
+			"Enqueue dropped message (peer=%s type=%s): peer closed",
+			p.ID, msg.Type,
+		)
 	}
 }
 
 func (p *Peer) Close() {
 	select {
 	case <-p.done:
+		logger.Websocket.Debugf(
+			"Peer already closed: %s",
+			p.ID,
+		)
 		return
 	default:
+		logger.Websocket.Infof(
+			"Closing peer: %s role=%s",
+			p.ID, p.Role,
+		)
 		close(p.done)
 		close(p.sendQueue)
 	}
@@ -155,6 +201,11 @@ func (p *Peer) StartPing(interval time.Duration) {
 	p.pingDone = make(chan struct{})
 
 	go func() {
+		logger.Websocket.Debugf(
+			"Ping loop started (peer=%s interval=%s)",
+			p.ID, interval,
+		)
+
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
@@ -167,10 +218,18 @@ func (p *Peer) StartPing(interval time.Duration) {
 					Ping: []byte("ping"),
 				}:
 				case <-p.done:
+					logger.Websocket.Debugf(
+						"Ping loop stopped (peer=%s)",
+						p.ID,
+					)
 					return
 				}
 
 			case <-p.done:
+				logger.Websocket.Debugf(
+					"Ping loop stopped (peer=%s)",
+					p.ID,
+				)
 				return
 			}
 		}
@@ -179,28 +238,64 @@ func (p *Peer) StartPing(interval time.Duration) {
 
 func loadPasswords() {
 	data, err := os.ReadFile("clients.json")
+
 	if err != nil {
+		logger.Websocket.Warnf(
+			"clients.json not found or unreadable, starting with empty passwords: %v",
+			err,
+		)
 		passwords = make(map[string]*PasswordEntry)
 		return
 	}
-	json.Unmarshal(data, &passwords)
+
+	if err := json.Unmarshal(data, &passwords); err != nil {
+		logger.Websocket.Errorf(
+			"Failed to parse clients.json: %v",
+			err,
+		)
+		passwords = make(map[string]*PasswordEntry)
+		return
+	}
+
+	logger.Websocket.Infof(
+		"Loaded %d password entries",
+		len(passwords),
+	)
 }
 
 func savePasswords() {
-	data, _ := json.MarshalIndent(passwords, "", "  ")
-	_ = os.WriteFile("clients.json", data, 0644)
+	data, err := json.MarshalIndent(passwords, "", "  ")
+	if err != nil {
+		logger.Websocket.Errorf("Failed to marshal passwords: %v", err)
+		return
+	}
+
+	if err := os.WriteFile("clients.json", data, 0644); err != nil {
+		logger.Websocket.Errorf("Failed to write clients.json: %v", err)
+		return
+	}
+
+	logger.Websocket.Debugf(
+		"Passwords saved successfully (%d entries)",
+		len(passwords),
+	)
 }
 
 func generateTempPass() string {
 	rand.Seed(time.Now().UnixNano())
+	logger.Websocket.Debug("Temporary password generated")
 	return fmt.Sprintf("%05d", rand.Intn(100000))
 }
 
 func loadBlacklist() {
 	data, err := os.ReadFile("blacklist.txt")
 	if err != nil {
+		logger.Websocket.Infof(
+			"Blacklist file not found, starting empty",
+		)
 		return
 	}
+
 	lines := strings.Split(string(data), "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -208,9 +303,15 @@ func loadBlacklist() {
 			blacklist[line] = struct{}{}
 		}
 	}
+
+	logger.Websocket.Infof(
+		"Loaded %d blacklisted IPs",
+		len(blacklist),
+	)
 }
 
 func getClientIP(r *http.Request) string {
+
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
@@ -242,16 +343,37 @@ func addToBlacklist(ip string) {
 	blacklistMu.Lock()
 	defer blacklistMu.Unlock()
 	if _, exists := blacklist[ip]; exists {
+		logger.Websocket.Debugf(
+			"IP already blacklisted: %s",
+			ip,
+		)
 		return
 	}
+
+	logger.Websocket.Warnf(
+		"IP added to blacklist: %s",
+		ip,
+	)
+
 	blacklist[ip] = struct{}{}
 	f, _ := os.OpenFile("blacklist.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	defer f.Close()
-	f.WriteString(ip + "\n")
+	if _, err := f.WriteString(ip + "\n"); err != nil {
+		logger.Websocket.Errorf(
+			"Failed to persist blacklist entry %s: %v",
+			ip, err,
+		)
+	}
 }
 
 func handleClientAuth(remoteIP string, msg Message, conn *websocket.Conn, entry *PasswordEntry) bool {
 	authStateMu.Lock()
+
+	logger.Websocket.Debugf(
+		"Auth attempt from %s client_id=%s",
+		remoteIP, msg.ClientID,
+	)
+
 	state, exists := authStateMap[remoteIP]
 	if !exists {
 		state = &AuthState{}
@@ -280,10 +402,20 @@ func handleClientAuth(remoteIP string, msg Message, conn *websocket.Conn, entry 
 	}
 
 	if !ok {
+		logger.Websocket.Warnf(
+			"Auth failed from %s (attempt %d)",
+			remoteIP, state.Attempts,
+		)
+
 		// неудачная попытка
 		authStateMu.Lock()
 		state.Attempts++
 		if state.Attempts >= 3 {
+			logger.Websocket.Warnf(
+				"Auth blocked for %s due to too many failures",
+				remoteIP,
+			)
+
 			state.Blocked = time.Now().Add(1 * time.Minute)
 			state.Attempts = 0 // сбрасываем попытки после блокировки
 			_ = conn.WriteJSON(Message{
@@ -300,6 +432,11 @@ func handleClientAuth(remoteIP string, msg Message, conn *websocket.Conn, entry 
 		return false
 	}
 
+	logger.Websocket.Infof(
+		"Client authenticated successfully: %s from %s",
+		msg.ClientID, remoteIP,
+	)
+
 	// успешная авторизация → сброс состояния
 	authStateMu.Lock()
 	state.Attempts = 0
@@ -313,12 +450,22 @@ func handleClientAuth(remoteIP string, msg Message, conn *websocket.Conn, entry 
 func wsHandler(w http.ResponseWriter, r *http.Request) {
 	remoteIP := getClientIP(r)
 
+	logger.Websocket.Debugf(
+		"Incoming websocket connection from %s (UA=%s)",
+		remoteIP,
+		r.UserAgent(),
+	)
+
 	// ПРОВЕРКА BLACKLIST ДО UPGRADE
 	blacklistMu.Lock()
 	_, banned := blacklist[remoteIP]
 	blacklistMu.Unlock()
 
 	if banned {
+		logger.Websocket.Warnf(
+			"Rejected websocket connection from banned IP %s",
+			remoteIP,
+		)
 		w.WriteHeader(http.StatusForbidden)
 		w.Write([]byte("IP_BANNED"))
 		return
@@ -326,6 +473,13 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 	// ТОЛЬКО ТЕПЕРЬ UPGRADE
 	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		logger.Websocket.Errorf(
+			"Websocket upgrade failed from %s: %v",
+			remoteIP, err,
+		)
+		return
+	}
 
 	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 
@@ -343,6 +497,17 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	authenticated := false
 
 	defer func() {
+		logger.Websocket.Debugf(
+			"Connection closing from %s (peer=%v)",
+			remoteIP,
+			func() string {
+				if peer != nil {
+					return peer.ID
+				}
+				return "nil"
+			}(),
+		)
+
 		if peer != nil {
 			peer.Close()
 		}
@@ -367,7 +532,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			// Удаляем администратора
 			delete(admins, peer.ID)
 			globalMu.Unlock()
-			log.Println("Admin disconnected:", peer.ID)
+			logger.Websocket.Infof("Admin disconnected: %v", peer.ID)
 		}
 
 		if peer != nil && peer.Role == "client" {
@@ -392,7 +557,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			delete(clients, peer.ID)
 			globalMu.Unlock()
 
-			log.Println("Client disconnected:", peer.ID)
+			logger.Websocket.Infof("Client disconnected: %v", peer.ID)
 		}
 
 		conn.Close()
@@ -401,8 +566,21 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	for {
 		var msg Message
 		if err := conn.ReadJSON(&msg); err != nil {
+			logger.Websocket.Warnf(
+				"ReadJSON failed from %s: %v",
+				remoteIP, err,
+			)
 			return
 		}
+
+		logger.Websocket.Debugf(
+			"Incoming message from %s: type=%s id=%s role=%s client_id=%s",
+			remoteIP,
+			msg.Type,
+			msg.ID,
+			msg.Role,
+			msg.ClientID,
+		)
 
 		if !authenticated {
 			switch msg.Type {
@@ -414,7 +592,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 				attempts := protocolViolations[remoteIP]
 				protocolViolationsMu.Unlock()
 
-				log.Printf(
+				logger.Websocket.Warnf(
 					"Protocol violation (unauthenticated) from %s: '%s' (%d/3)",
 					remoteIP, msg.Type, attempts,
 				)
@@ -452,10 +630,16 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		switch msg.Type {
 		case "admin_hello":
 			if msg.ApiKey != "b5679e9e-b5b5-4eaf-bb99-83dba95f9f53" {
+
 				adminAttemptsMu.Lock()
 				adminAttempts[remoteIP]++
 				attempts := adminAttempts[remoteIP]
 				adminAttemptsMu.Unlock()
+
+				logger.Websocket.Warnf(
+					"Invalid admin API key from %s (%d/3)",
+					remoteIP, attempts,
+				)
 
 				if attempts >= 3 {
 					addToBlacklist(remoteIP)
@@ -472,6 +656,11 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 				})
 				continue
 			}
+
+			logger.Websocket.Infof(
+				"Admin authenticated successfully from %s",
+				remoteIP,
+			)
 
 			// успешная авторизация → сброс счетчика
 			adminAttemptsMu.Lock()
@@ -495,6 +684,11 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			authMu.Unlock()
 
 			if !exists {
+				logger.Websocket.Warnf(
+					"Auth failed: unknown client id=%s from %s",
+					msg.ClientID, remoteIP,
+				)
+
 				_ = conn.WriteJSON(Message{
 					Type:  "auth_fail",
 					Error: "Unknown client",
@@ -507,6 +701,11 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			globalMu.Unlock()
 
 			if !online || client == nil {
+				logger.Websocket.Infof(
+					"Auth failed: client %s offline (admin=%s)",
+					msg.ClientID, msg.ID,
+				)
+
 				_ = conn.WriteJSON(Message{
 					Type:  "auth_fail",
 					Error: "Client is offline",
@@ -518,6 +717,11 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
+			logger.Websocket.Infof(
+				"Admin %s authenticated and attached to client %s",
+				msg.ID, msg.ClientID,
+			)
+
 			authenticated = true
 			sessions[msg.ID] = msg.ClientID // сохраняем, чтобы знать, к какому клиенту привязывать админа
 
@@ -527,6 +731,11 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 			// ---------------- REGISTER ----------------
 		case "register":
+			logger.Websocket.Debugf(
+				"Register peer id=%s role=%s from %s",
+				msg.ID, msg.Role, remoteIP,
+			)
+
 			if msg.Role == "admin" && !authenticated {
 				_ = conn.WriteJSON(Message{
 					Type:  "auth_fail",
@@ -542,6 +751,13 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 				sendQueue: make(chan OutboundMessage, 32),
 				done:      make(chan struct{}),
 			}
+
+			logger.Websocket.Infof(
+				"%s registered successfully: %s",
+				strings.Title(msg.Role),
+				msg.ID,
+			)
+
 			peer.StartWriter()
 			peer.StartPing(30 * time.Second)
 
@@ -559,7 +775,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			globalMu.Unlock() // <- освободили мьютекс до WriteJSON
 
-			log.Println("Admin connected:", peer.ID)
+			logger.Websocket.Infof("Admin connected: %v", peer.ID)
 
 			if targetClient != nil {
 				targetClient.Enqueue(Message{
@@ -568,7 +784,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 				})
 			} else {
 				clients[peer.ID] = peer
-				log.Println("Client connected:", peer.ID)
+				logger.Websocket.Infof("Client connected: %v", peer.ID)
 			}
 
 		// ================= CLIENT HELLO =================
@@ -581,7 +797,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 				attempts := clientAttempts[remoteIP]
 				clientAttemptsMu.Unlock()
 
-				log.Printf(
+				logger.Websocket.Warnf(
 					"Invalid API key from client %s (%d/3)",
 					remoteIP, attempts,
 				)
@@ -639,7 +855,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 				savePasswords()
 				authMu.Unlock()
 
-				log.Println("Password updated via pass-only connection:", msg.ID)
+				logger.Websocket.Infof("Password updated via pass-only connection: %v", msg.ID)
 
 				_ = conn.WriteJSON(Message{
 					Type: "password_updated",
@@ -709,6 +925,14 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			client := clients[msg.ClientID]
 			globalMu.Unlock()
 
+			logger.Websocket.Debugf(
+				"Routing %s from %s to client %s (cmd_id=%s)",
+				msg.Type,
+				msg.ID,
+				msg.ClientID,
+				msg.CommandID,
+			)
+
 			if client != nil {
 				client.Enqueue(Message{
 					Type:      msg.Type,
@@ -726,15 +950,35 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			admin := admins[adminID]
 			globalMu.Unlock()
 
+			logger.Websocket.Debugf(
+				"Routing %s from %s to client %s (cmd_id=%s)",
+				msg.Type,
+				msg.ID,
+				msg.ClientID,
+				msg.CommandID,
+			)
+
 			if admin != nil {
 				admin.Enqueue(msg)
 			}
 
 		case "session_closed":
+			logger.Websocket.Infof(
+				"Session close requested by client: admin_id=%s",
+				msg.ID,
+			)
+
 			adminID := msg.ID
 
 			globalMu.Lock()
 			admin := admins[adminID]
+
+			if admin == nil {
+				logger.Websocket.Warnf(
+					"Session close requested, but admin not found: admin_id=%s",
+					adminID,
+				)
+			}
 			globalMu.Unlock()
 
 			if admin != nil {
@@ -743,6 +987,11 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 					Error: "CMD session terminated on client",
 				})
 				delete(sessions, adminID)
+
+				logger.Websocket.Infof(
+					"Session closed: admin_id=%s (initiated by client)",
+					adminID,
+				)
 			}
 
 		default:
@@ -751,7 +1000,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			attempts := protocolViolations[remoteIP]
 			protocolViolationsMu.Unlock()
 
-			log.Printf(
+			logger.Websocket.Warnf(
 				"Protocol violation from %s: unknown message type '%s' (%d/3)",
 				remoteIP, msg.Type, attempts,
 			)
