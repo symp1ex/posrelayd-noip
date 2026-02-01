@@ -5,6 +5,7 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 
+COPY config ./config
 COPY crypto ./crypto
 COPY logger ./logger
 COPY main.go ./
