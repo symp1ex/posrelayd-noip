@@ -8,6 +8,7 @@ RUN go mod download
 COPY config ./config
 COPY crypto ./crypto
 COPY logger ./logger
+COPY storage ./storage
 COPY main.go ./
 
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \

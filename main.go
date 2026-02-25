@@ -1,12 +1,12 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
 	"math/rand"
 	"net"
 	"net/http"
-	"os"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -16,7 +16,10 @@ import (
 	"posrelayd-noip/config"
 	"posrelayd-noip/crypto"
 	"posrelayd-noip/logger"
+	"posrelayd-noip/storage"
 )
+
+var db *storage.Storage
 
 type Peer struct {
 	ID   string
@@ -79,10 +82,8 @@ var (
 	sessions = make(map[string]string)
 	globalMu sync.Mutex
 
-	passwords    = make(map[string]*PasswordEntry)
 	authStateMu  sync.Mutex
 	authStateMap = make(map[string]*AuthState)
-	authMu       sync.Mutex
 
 	adminAttempts   = make(map[string]int)
 	adminAttemptsMu sync.Mutex
@@ -92,9 +93,6 @@ var (
 
 	protocolViolations   = make(map[string]int)
 	protocolViolationsMu sync.Mutex
-
-	blacklist   = make(map[string]struct{})
-	blacklistMu sync.Mutex
 
 	trustedProxies = map[string]struct{}{
 		"127.0.0.1": {},
@@ -237,78 +235,10 @@ func (p *Peer) StartPing(interval time.Duration) {
 	}()
 }
 
-func loadPasswords() {
-	data, err := os.ReadFile("clients.json")
-
-	if err != nil {
-		logger.Websocket.Warnf(
-			"clients.json not found or unreadable, starting with empty passwords: %v",
-			err,
-		)
-		passwords = make(map[string]*PasswordEntry)
-		return
-	}
-
-	if err := json.Unmarshal(data, &passwords); err != nil {
-		logger.Websocket.Errorf(
-			"Failed to parse clients.json: %v",
-			err,
-		)
-		passwords = make(map[string]*PasswordEntry)
-		return
-	}
-
-	logger.Websocket.Infof(
-		"Loaded %d password entries",
-		len(passwords),
-	)
-}
-
-func savePasswords() {
-	data, err := json.MarshalIndent(passwords, "", "  ")
-	if err != nil {
-		logger.Websocket.Errorf("Failed to marshal passwords: %v", err)
-		return
-	}
-
-	if err := os.WriteFile("clients.json", data, 0644); err != nil {
-		logger.Websocket.Errorf("Failed to write clients.json: %v", err)
-		return
-	}
-
-	logger.Websocket.Debugf(
-		"Passwords saved successfully (%d entries)",
-		len(passwords),
-	)
-}
-
 func generateTempPass() string {
 	rand.Seed(time.Now().UnixNano())
 	logger.Websocket.Debug("Temporary password generated")
 	return fmt.Sprintf("%05d", rand.Intn(100000))
-}
-
-func loadBlacklist() {
-	data, err := os.ReadFile("blacklist.txt")
-	if err != nil {
-		logger.Websocket.Infof(
-			"Blacklist file not found, starting empty",
-		)
-		return
-	}
-
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			blacklist[line] = struct{}{}
-		}
-	}
-
-	logger.Websocket.Infof(
-		"Loaded %d blacklisted IPs",
-		len(blacklist),
-	)
 }
 
 func getClientIP(r *http.Request) string {
@@ -341,30 +271,16 @@ func getClientIP(r *http.Request) string {
 
 // Добавляем IP в blacklist
 func addToBlacklist(ip string) {
-	blacklistMu.Lock()
-	defer blacklistMu.Unlock()
-	if _, exists := blacklist[ip]; exists {
-		logger.Websocket.Debugf(
-			"IP already blacklisted: %s",
-			ip,
-		)
+	logger.Websocket.Warnf("Attempt to add IP to blacklist: %s", ip)
+
+	_, err := db.Pool.Exec(context.Background(),
+		"INSERT INTO blacklist (ip) VALUES ($1) ON CONFLICT DO NOTHING", ip)
+
+	if err != nil {
+		logger.Websocket.Errorf("DB: Error while adding %s in blacklist: %v", ip, err)
 		return
 	}
-
-	logger.Websocket.Warnf(
-		"IP added to blacklist: %s",
-		ip,
-	)
-
-	blacklist[ip] = struct{}{}
-	f, _ := os.OpenFile("blacklist.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	defer f.Close()
-	if _, err := f.WriteString(ip + "\n"); err != nil {
-		logger.Websocket.Errorf(
-			"Failed to persist blacklist entry %s: %v",
-			ip, err,
-		)
-	}
+	logger.Websocket.Infof("DB: IP %s successfully locked in the database", ip)
 }
 
 func handleClientAuth(remoteIP string, msg Message, conn *websocket.Conn, entry *PasswordEntry) bool {
@@ -458,15 +374,9 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	)
 
 	// ПРОВЕРКА BLACKLIST ДО UPGRADE
-	blacklistMu.Lock()
-	_, banned := blacklist[remoteIP]
-	blacklistMu.Unlock()
-
+	banned := db.IsBlacklisted(r.Context(), remoteIP)
 	if banned {
-		logger.Websocket.Warnf(
-			"Rejected websocket connection from banned IP %s",
-			remoteIP,
-		)
+		logger.Websocket.Warnf("Rejected websocket connection from banned IP %s", remoteIP)
 		w.WriteHeader(http.StatusForbidden)
 		w.Write([]byte("IP_BANNED"))
 		return
@@ -680,38 +590,38 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		// ================= AUTH =================
 
 		case "auth":
-			authMu.Lock()
-			entry, exists := passwords[msg.ClientID]
-			authMu.Unlock()
+			logger.Websocket.Debugf("Client authorization request for %s from admin", msg.ClientID)
 
-			if !exists {
+			clientData, err := db.GetClient(r.Context(), msg.ClientID)
+			if err != nil {
 				logger.Websocket.Warnf(
 					"Auth failed: unknown client id=%s from %s",
 					msg.ClientID, remoteIP,
 				)
-
-				_ = conn.WriteJSON(Message{
-					Type:  "auth_fail",
-					Error: "Unknown client",
-				})
+				_ = conn.WriteJSON(Message{Type: "auth_fail", Error: "Unknown client"})
 				continue
 			}
 
 			globalMu.Lock()
-			client, online := clients[msg.ClientID]
+			_, online := clients[msg.ClientID]
 			globalMu.Unlock()
 
-			if !online || client == nil {
+			if !online {
 				logger.Websocket.Infof(
 					"Auth failed: client %s offline (admin=%s)",
 					msg.ClientID, msg.ID,
 				)
-
-				_ = conn.WriteJSON(Message{
-					Type:  "auth_fail",
-					Error: "Client is offline",
-				})
+				_ = conn.WriteJSON(Message{Type: "auth_fail", Error: "Client is offline"})
 				continue
+			}
+
+			// Создаем структуру для совместимости с handleClientAuth
+			entry := &PasswordEntry{
+				Password: clientData.Password,
+				TempPass: clientData.TempPass,
+			}
+			if clientData.Password == "" {
+				entry.Password = false
 			}
 
 			if !handleClientAuth(remoteIP, msg, conn, entry) {
@@ -828,23 +738,12 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			delete(protocolViolations, remoteIP)
 			protocolViolationsMu.Unlock()
 
-			authMu.Lock()
-
-			entry, exists := passwords[msg.ID]
-			if !exists {
-				entry = &PasswordEntry{
-					Password: false,
-				}
-				passwords[msg.ID] = entry
-			}
-
 			// =========================
 			// PASS-ONLY РЕЖИМ (-pass)
 			// =========================
 			if msg.Password != "" {
 				encrypted, err := crypto.Encrypt(msg.Password)
 				if err != nil {
-					authMu.Unlock()
 					_ = conn.WriteJSON(Message{
 						Type:  "error",
 						Error: "Password encryption failed",
@@ -852,9 +751,12 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 
-				entry.Password = encrypted
-				savePasswords()
-				authMu.Unlock()
+				err = db.UpsertClient(r.Context(), msg.ID, encrypted, "")
+				if err != nil {
+					logger.Websocket.Errorf("DB: Error saving persistent client password %s: %v", msg.ID, err)
+				} else {
+					logger.Websocket.Infof("DB: The client %s permanent password has been updated in the database.", msg.ID)
+				}
 
 				logger.Websocket.Infof("Password updated via pass-only connection: %v", msg.ID)
 
@@ -877,7 +779,6 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 			encryptedTemp, err := crypto.Encrypt(plainTemp)
 			if err != nil {
-				authMu.Unlock()
 				_ = conn.WriteJSON(Message{
 					Type:  "error",
 					Error: "Temp password encryption failed",
@@ -885,10 +786,18 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			entry.TempPass = encryptedTemp
-			savePasswords()
+			clientData, _ := db.GetClient(r.Context(), msg.ID)
+			currPass := ""
+			if clientData != nil {
+				currPass = clientData.Password
+			}
 
-			authMu.Unlock()
+			err = db.UpsertClient(r.Context(), msg.ID, currPass, encryptedTemp)
+			if err != nil {
+				logger.Websocket.Errorf("DB: Error saving client temporary password %s: %v", msg.ID, err)
+			} else {
+				logger.Websocket.Debugf("DB: Temporary password for %s saved", msg.ID)
+			}
 
 			peer = &Peer{
 				ID:        msg.ID,
@@ -905,10 +814,8 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			globalMu.Unlock()
 
 			logger.Websocket.Infof(
-				"Client connected: %s, \"temp_pass:\" %s, \"password_set:\" %v",
+				"Client connected: %s",
 				msg.ID,
-				entry.TempPass,
-				entry.Password != false,
 			)
 
 			// ОТПРАВЛЯЕМ temp_pass PY-КЛИЕНТУ
@@ -1029,8 +936,29 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	loadPasswords()
-	loadBlacklist()
+	dbUser := config.Cfg.Db.User
+	dbPass := config.Cfg.Db.Password
+	dbHost := config.Cfg.Db.Host
+	dbPort := config.Cfg.Db.Port
+	dbName := config.Cfg.Db.Db_name
+
+	u := &url.URL{
+		Scheme: "postgres",
+		User:   url.UserPassword(dbUser, dbPass),
+		Host:   fmt.Sprintf("%s:%d", dbHost, dbPort),
+		Path:   dbName,
+	}
+
+	dsn := u.String()
+
+	var err error
+	logger.Websocket.Info("Initializing PostgreSQL storage...")
+	db, err = storage.NewStorage(dsn)
+	if err != nil {
+		logger.Websocket.Errorf("Failed to start the database: %v", err)
+	}
+	defer db.Pool.Close()
+	logger.Websocket.Info("The storage has been connected successfully.")
 
 	port := config.Cfg.Service.Port
 

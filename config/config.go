@@ -12,12 +12,21 @@ var Cfg Config
 
 type Config struct {
 	Service ServiceConfig `json:"service"`
+	Db      DbConfig      `json:"database"`
 	Logs    LogsConfig    `json:"logs"`
 }
 
 type ServiceConfig struct {
 	Port   int    `json:"port"`
 	APIKey string `json:"api_key"`
+}
+
+type DbConfig struct {
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Db_name  string `json:"db_name"`
+	User     string `json:"user"`
+	Password string `json:"password"`
 }
 
 type LogsConfig struct {
@@ -64,6 +73,13 @@ func defaultConfig() Config {
 		Service: ServiceConfig{
 			Port:   22233,
 			APIKey: "b5679e9e-b5b5-4eaf-bb99-83dba95f9f53",
+		},
+		Db: DbConfig{
+			Host:     "192.168.0.30",
+			Port:     40222,
+			Db_name:  "pr_noip",
+			User:     "user",
+			Password: "password",
 		},
 		Logs: LogsConfig{
 			LogLevel:  "info",
