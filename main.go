@@ -392,10 +392,14 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	waitTimeout := 70 * time.Second
 
+	conn.SetReadLimit(512 * 1024) // Лимит на размер сообщения 512Кб
+	conn.SetReadDeadline(time.Now().Add(waitTimeout))
+
+	// при получении PONG от клиента мы сбрасываем счетчик таймаута
 	conn.SetPongHandler(func(string) error {
-		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		conn.SetReadDeadline(time.Now().Add(waitTimeout))
 		return nil
 	})
 
@@ -774,6 +778,14 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			// =========================
 			// ОБЫЧНЫЙ PY-КЛИЕНТ
 			// =========================
+
+			globalMu.Lock()
+			if oldPeer, ok := clients[msg.ID]; ok {
+				logger.Websocket.Infof("Replacing stale session for client ID: %s", msg.ID)
+				oldPeer.Close()         // Закрываем старый сокет
+				delete(clients, msg.ID) // Удаляем из списка
+			}
+			globalMu.Unlock()
 
 			plainTemp := generateTempPass()
 
