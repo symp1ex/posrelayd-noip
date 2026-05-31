@@ -391,60 +391,50 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		)
 		return
 	}
+	defer conn.Close()
 
 	waitTimeout := 70 * time.Second
 
-	conn.SetReadLimit(512 * 1024) // Лимит на размер сообщения 512Кб
+	conn.SetReadLimit(512 * 1024)
 	conn.SetReadDeadline(time.Now().Add(waitTimeout))
 
-	// при получении PONG от клиента мы сбрасываем счетчик таймаута
+	// 1. Когда сервер пингует клиента, клиент присылает PONG
 	conn.SetPongHandler(func(string) error {
 		conn.SetReadDeadline(time.Now().Add(waitTimeout))
 		return nil
 	})
 
-	if err != nil {
-		return
-	}
-	defer conn.Close()
+	// 2. Когда клиент пингует сервер, сервер получает PING
+	conn.SetPingHandler(func(appData string) error {
+		conn.SetReadDeadline(time.Now().Add(waitTimeout))
+		// Обязательно отвечаем клиенту, иначе он подумает, что сервер умер
+		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(5*time.Second))
+	})
 
 	var peer *Peer
 	authenticated := false
 
 	defer func() {
-		logger.Websocket.Debugf(
-			"Connection closing from %s (peer=%v)",
-			remoteIP,
+		logger.Websocket.Debugf("Connection closing from %s (peer=%v)", remoteIP,
 			func() string {
 				if peer != nil {
 					return peer.ID
 				}
 				return "nil"
-			}(),
-		)
+			}())
 
 		if peer != nil {
 			peer.Close()
 		}
-		// ADMIN DETACH ON DISCONNECT
+
 		if peer != nil && peer.Role == "admin" {
 			globalMu.Lock()
-
-			// Получаем clientID, привязанный к этому администратору
-			clientID, ok := sessions[peer.ID]
-			if ok {
-				// Найти объект клиента по clientID
-				client, ok := clients[clientID]
-				if ok {
-					client.Enqueue(Message{
-						Type: "admin_detach",
-						ID:   peer.ID,
-					})
+			if clientID, ok := sessions[peer.ID]; ok {
+				if client, ok := clients[clientID]; ok {
+					client.Enqueue(Message{Type: "admin_detach", ID: peer.ID})
 				}
-				// После отправки удалить сессию
 				delete(sessions, peer.ID)
 			}
-			// Удаляем администратора
 			delete(admins, peer.ID)
 			globalMu.Unlock()
 			logger.Websocket.Infof("Admin disconnected: %v", peer.ID)
@@ -452,29 +442,23 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 		if peer != nil && peer.Role == "client" {
 			globalMu.Lock()
+			// КРИТИЧЕСКАЯ ПРАВКА: Удаляем из карты только если там лежит именно ЭТОТ объект
+			if clients[peer.ID] == peer {
+				delete(clients, peer.ID)
+				logger.Websocket.Infof("Client mapping removed: %s", peer.ID)
+			}
 
 			for adminID, clientID := range sessions {
 				if clientID == peer.ID {
-					// Найти объект admin по adminID
-					admin, ok := admins[adminID]
-					if !ok {
-						continue // если админа нет, пропускаем
+					if admin, ok := admins[adminID]; ok {
+						admin.Enqueue(Message{Type: "session_closed", ClientID: peer.ID, Error: "Client disconnected"})
 					}
-					admin.Enqueue(Message{
-						Type:     "session_closed",
-						ClientID: peer.ID,
-						Error:    "Client disconnected",
-					})
 					delete(sessions, adminID)
 				}
 			}
-
-			delete(clients, peer.ID)
 			globalMu.Unlock()
-
 			logger.Websocket.Infof("Client disconnected: %v", peer.ID)
 		}
-
 		conn.Close()
 	}()
 
@@ -485,8 +469,11 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 				"ReadJSON failed from %s: %v",
 				remoteIP, err,
 			)
+			conn.SetReadDeadline(time.Now().Add(waitTimeout))
 			return
 		}
+
+		conn.SetReadDeadline(time.Now().Add(waitTimeout))
 
 		logger.Websocket.Debugf(
 			"Incoming message from %s: type=%s id=%s role=%s client_id=%s",
