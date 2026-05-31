@@ -33,14 +33,15 @@ type Peer struct {
 }
 
 type Message struct {
-	Type      string                 `json:"type"`
-	ClientID  string                 `json:"client_id,omitempty"`
-	CommandID string                 `json:"command_id,omitempty"`
-	Command   string                 `json:"command,omitempty"`
-	Prompt    string                 `json:"prompt,omitempty"`
-	Result    map[string]interface{} `json:"result,omitempty"`
-	Role      string                 `json:"role,omitempty"`
-	ID        string                 `json:"id,omitempty"`
+	Type       string                 `json:"type"`
+	ClientID   string                 `json:"client_id,omitempty"`
+	ClientCode int64                  `json:"client_code,omitempty"`
+	CommandID  string                 `json:"command_id,omitempty"`
+	Command    string                 `json:"command,omitempty"`
+	Prompt     string                 `json:"prompt,omitempty"`
+	Result     map[string]interface{} `json:"result,omitempty"`
+	Role       string                 `json:"role,omitempty"`
+	ID         string                 `json:"id,omitempty"`
 
 	// === AUTH ===
 	Password string `json:"password,omitempty"`
@@ -360,7 +361,6 @@ func handleClientAuth(remoteIP string, msg Message, conn *websocket.Conn, entry 
 	state.Blocked = time.Time{}
 	authStateMu.Unlock()
 
-	_ = conn.WriteJSON(Message{Type: "auth_ok"})
 	return true
 }
 
@@ -583,6 +583,26 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		case "auth":
 			logger.Websocket.Debugf("Client authorization request for %s from admin", msg.ClientID)
 
+			realClientID, err := db.ResolveClientID(r.Context(), msg.ClientID)
+			if err != nil {
+				logger.Websocket.Warnf(
+					"Auth failed: unknown client id/code=%s from %s",
+					msg.ClientID, remoteIP,
+				)
+				_ = conn.WriteJSON(Message{Type: "auth_fail", Error: "Unknown client"})
+				continue
+			}
+
+			if realClientID != msg.ClientID {
+				logger.Websocket.Infof(
+					"Resolved client code %s to UUID %s",
+					msg.ClientID,
+					realClientID,
+				)
+			}
+
+			msg.ClientID = realClientID
+
 			clientData, err := db.GetClient(r.Context(), msg.ClientID)
 			if err != nil {
 				logger.Websocket.Warnf(
@@ -626,6 +646,11 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 			authenticated = true
 			sessions[msg.ID] = msg.ClientID // сохраняем, чтобы знать, к какому клиенту привязывать админа
+
+			_ = conn.WriteJSON(Message{
+				Type:     "auth_ok",
+				ClientID: msg.ClientID,
+			})
 
 			protocolViolationsMu.Lock()
 			delete(protocolViolations, remoteIP)
@@ -817,11 +842,20 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 				msg.ID,
 			)
 
+			clientData, _ = db.GetClient(r.Context(), msg.ID)
+
 			// ОТПРАВЛЯЕМ temp_pass PY-КЛИЕНТУ
 			_ = conn.WriteJSON(Message{
 				Type:     "temp_pass",
 				TempPass: plainTemp,
 			})
+
+			if clientData != nil {
+				_ = conn.WriteJSON(Message{
+					Type:       "client_code",
+					ClientCode: clientData.ClientCode,
+				})
+			}
 
 			authenticated = true
 
