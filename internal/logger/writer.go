@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"posrelayd-noip/config"
+	"posrelayd-noip/internal/config"
 )
 
 var (
