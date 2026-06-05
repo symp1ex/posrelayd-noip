@@ -6,27 +6,57 @@ import (
 )
 
 func (s *Server) handleCommand(msg Message) {
+	adminID := msg.ID
+	targetClientID := msg.ClientID
+
 	globalMu.Lock()
-	client := clients[msg.ClientID]
+
+	if boundClientID, ok := sessions[adminID]; ok && boundClientID != "" {
+		targetClientID = boundClientID
+	}
+
+	client := clients[targetClientID]
+	admin := admins[adminID]
+
 	globalMu.Unlock()
 
 	logger.Websocket.Debugf(
-		"Routing %s from %s to client %s (cmd_id=%s)",
+		"Routing %s from admin=%s to client=%s requested_client_id=%s (cmd_id=%s)",
 		msg.Type,
-		msg.ID,
+		adminID,
+		targetClientID,
 		msg.ClientID,
 		msg.CommandID,
 	)
 
-	if client != nil {
-		client.Enqueue(Message{
-			Type:      msg.Type,
-			ClientID:  msg.ClientID,
-			CommandID: msg.CommandID,
-			Command:   msg.Command,
-			ID:        msg.ID,
-		})
+	if client == nil {
+		logger.Websocket.Warnf(
+			"Routing dropped: target client not found admin=%s requested_client_id=%s resolved_client_id=%s cmd_id=%s",
+			adminID,
+			msg.ClientID,
+			targetClientID,
+			msg.CommandID,
+		)
+
+		if admin != nil {
+			admin.Enqueue(Message{
+				Type:      "error",
+				ClientID:  targetClientID,
+				CommandID: msg.CommandID,
+				Error:     "Client is offline or session is not attached",
+			})
+		}
+
+		return
 	}
+
+	client.Enqueue(Message{
+		Type:      msg.Type,
+		ClientID:  targetClientID,
+		CommandID: msg.CommandID,
+		Command:   msg.Command,
+		ID:        adminID,
+	})
 }
 
 func (s *Server) handleResult(msg Message) {

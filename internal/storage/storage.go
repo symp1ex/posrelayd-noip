@@ -16,6 +16,7 @@ type ClientEntry struct {
 	Password   string
 	TempPass   string
 	ClientCode int64
+	Signature  string
 }
 
 type Storage struct {
@@ -96,7 +97,8 @@ func (s *Storage) initTables(ctx context.Context) error {
 	CREATE TABLE IF NOT EXISTS clients (
 		id TEXT PRIMARY KEY,
 		password TEXT DEFAULT '',
-		temp_pass TEXT DEFAULT ''
+		temp_pass TEXT DEFAULT '',
+		signature TEXT DEFAULT ''
 	);
 
 	CREATE TABLE IF NOT EXISTS blacklist (
@@ -105,6 +107,13 @@ func (s *Storage) initTables(ctx context.Context) error {
 	);`
 	if _, err := s.Pool.Exec(ctx, query); err != nil {
 		logger.Websocket.Errorf("DB: Failed to create tables: %v", err)
+		return err
+	}
+
+	// Добавляем signature если нет
+	if _, err := s.Pool.Exec(ctx, `
+		ALTER TABLE clients ADD COLUMN IF NOT EXISTS signature TEXT DEFAULT ''
+	`); err != nil {
 		return err
 	}
 
@@ -118,44 +127,6 @@ func (s *Storage) initTables(ctx context.Context) error {
 
 	if err := s.migrateClientCodes(ctx); err != nil {
 		return err
-	}
-
-	return nil
-}
-
-func (s *Storage) migrateClientCodes(ctx context.Context) error {
-	rows, err := s.Pool.Query(ctx, `
-		SELECT id
-		FROM clients
-		WHERE client_code IS NULL
-	`)
-	if err != nil {
-		logger.Websocket.Errorf("DB: Failed to fetch clients without client_code: %v", err)
-		return err
-	}
-	defer rows.Close()
-
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return err
-		}
-		ids = append(ids, id)
-	}
-
-	if err := rows.Err(); err != nil {
-		return err
-	}
-
-	for _, id := range ids {
-		code, err := s.ensureClientCode(ctx, id)
-		if err != nil {
-			logger.Websocket.Errorf("DB: Failed to migrate client_code for %s: %v", id, err)
-			return err
-		}
-
-		logger.Websocket.Infof("DB: Migrated client_code for %s: %d", id, code)
 	}
 
 	return nil

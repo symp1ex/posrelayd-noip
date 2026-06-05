@@ -16,6 +16,13 @@ type Message struct {
 	ApiKey   string `json:"api_key,omitempty"`
 	TempPass string `json:"temp_pass,omitempty"`
 	Error    string `json:"error,omitempty"`
+
+	// === HANDSHAKE ===
+	PublicKey   string `json:"public_key,omitempty"`
+	Signature   string `json:"signature,omitempty"` // Здесь приходит подпись (sign)
+	Challenge   string `json:"challenge,omitempty"`
+	Answer      any    `json:"answer,omitempty"` // Может быть string ("ok", "fail" etc)
+	Description string `json:"description,omitempty"`
 }
 
 type OutboundMessage struct {

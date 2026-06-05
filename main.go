@@ -8,7 +8,7 @@ import (
 )
 
 func main() {
-	version := "0.3.3.2"
+	version := "0.3.4.1"
 
 	logger.Websocket.Infof(
 		"POSRelayd-NoIP.v%s starting...", version)

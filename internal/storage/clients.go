@@ -14,11 +14,23 @@ func (s *Storage) GetClient(ctx context.Context, id string) (*ClientEntry, error
 	logger.Websocket.Debugf("DB: Fetching client data for ID: %s", id)
 
 	var c ClientEntry
+
 	err := s.Pool.QueryRow(ctx, `
-		SELECT id, password, temp_pass, client_code
+		SELECT
+			id,
+			COALESCE(password, ''),
+			COALESCE(temp_pass, ''),
+			COALESCE(client_code, 0),
+			COALESCE(signature, '')
 		FROM clients
 		WHERE id = $1
-	`, id).Scan(&c.ID, &c.Password, &c.TempPass, &c.ClientCode)
+	`, id).Scan(
+		&c.ID,
+		&c.Password,
+		&c.TempPass,
+		&c.ClientCode,
+		&c.Signature,
+	)
 
 	if err != nil {
 		if err == pgx.ErrNoRows {
@@ -70,6 +82,25 @@ func (s *Storage) UpsertClient(ctx context.Context, id, pass, temp string) error
 	}
 
 	return nil
+}
+
+func (s *Storage) GetClientBySignature(ctx context.Context, sig string) (*ClientEntry, error) {
+	var c ClientEntry
+	err := s.Pool.QueryRow(ctx, `
+		SELECT id, password, temp_pass, client_code, signature
+		FROM clients
+		WHERE signature = $1
+	`, sig).Scan(&c.ID, &c.Password, &c.TempPass, &c.ClientCode, &c.Signature)
+
+	if err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+func (s *Storage) UpdateClientSignature(ctx context.Context, id, sig string) error {
+	_, err := s.Pool.Exec(ctx, "UPDATE clients SET signature = $1 WHERE id = $2", sig, id)
+	return err
 }
 
 func (s *Storage) ResolveClientID(ctx context.Context, clientID string) (string, error) {

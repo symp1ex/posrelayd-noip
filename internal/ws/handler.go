@@ -59,6 +59,7 @@ func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 
 	var peer *Peer
 	authenticated := false
+	hState := &handshakeState{}
 
 	defer func() {
 		s.disconnect(peer, conn, remoteIP)
@@ -88,7 +89,7 @@ func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 
 		if !authenticated {
 			switch msg.Type {
-			case "admin_hello", "auth", "client_hello":
+			case "admin_hello", "client_hello", "sign":
 				// разрешено
 			default:
 				protocolViolationsMu.Lock()
@@ -194,18 +195,29 @@ func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			if msg.Password != "" {
-				s.handlePasswordUpdate(
-					r,
-					conn,
-					msg,
-				)
-				return
+			// Выполняем логику рукопожатия
+			ok, reason := s.handleHandshake(r, hState, msg)
+			if !ok {
+				_ = conn.WriteJSON(Message{Type: "handshake", Answer: "fail", Description: reason})
+				return // Закрываем соединение при провале
 			}
 
-			newPeer, ok := s.handleClientHello(
+			_ = conn.WriteJSON(Message{
+				Type:      "handshake",
+				Answer:    "check",
+				Challenge: hState.challenge,
+			})
+
+			logger.Websocket.Debugf(
+				"Handshake challenge sent to client %s",
+				msg.ID,
+			)
+
+		case "sign":
+			newPeer, ok := s.handleHandshakeSign(
 				r,
 				conn,
+				hState,
 				msg,
 			)
 
