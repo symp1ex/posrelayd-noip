@@ -85,6 +85,8 @@ func (s *Storage) UpsertClient(ctx context.Context, id, pass, temp string) error
 }
 
 func (s *Storage) GetClientBySignature(ctx context.Context, sig string) (*ClientEntry, error) {
+	logger.Websocket.Debugf("Storage: lookup client by signature, signatureLen=%d", len(sig))
+
 	var c ClientEntry
 	err := s.Pool.QueryRow(ctx, `
 		SELECT id, password, temp_pass, client_code, signature
@@ -93,17 +95,34 @@ func (s *Storage) GetClientBySignature(ctx context.Context, sig string) (*Client
 	`, sig).Scan(&c.ID, &c.Password, &c.TempPass, &c.ClientCode, &c.Signature)
 
 	if err != nil {
+		if err == pgx.ErrNoRows {
+			logger.Websocket.Debugf("Storage: client by signature not found, signatureLen=%d", len(sig))
+		} else {
+			logger.Websocket.Errorf("Storage: failed to lookup client by signature, signatureLen=%d: %v", len(sig), err)
+		}
 		return nil, err
 	}
+	logger.Websocket.Debugf("Storage: client by signature found, clientID=%s", c.ID)
 	return &c, nil
 }
 
 func (s *Storage) UpdateClientSignature(ctx context.Context, id, sig string) error {
 	_, err := s.Pool.Exec(ctx, "UPDATE clients SET signature = $1 WHERE id = $2", sig, id)
+	if err != nil {
+		logger.Websocket.Errorf("Storage: failed to update client signature, clientID=%s: %v", id, err)
+	} else {
+		logger.Websocket.Infof(
+			"Storage: client signature updated, clientID=%s, signatureProvided=%t",
+			id,
+			sig != "",
+		)
+	}
 	return err
 }
 
 func (s *Storage) ResolveClientID(ctx context.Context, clientID string) (string, error) {
+	logger.Websocket.Debugf("Storage: resolving client ID, input=%s", clientID)
+
 	var id string
 
 	err := s.Pool.QueryRow(ctx, `
@@ -113,15 +132,20 @@ func (s *Storage) ResolveClientID(ctx context.Context, clientID string) (string,
 	`, clientID).Scan(&id)
 
 	if err == nil {
+		logger.Websocket.Infof("Storage: client resolved by ID, clientID=%s", id)
 		return id, nil
 	}
 
 	if err != pgx.ErrNoRows {
+		logger.Websocket.Errorf("Storage: failed to resolve client by ID, input=%s: %v", clientID, err)
 		return "", err
 	}
 
+	logger.Websocket.Debugf("Storage: client not found by ID, trying client_code, input=%s", clientID)
+
 	var code int64
 	if _, scanErr := fmt.Sscanf(clientID, "%d", &code); scanErr != nil {
+		logger.Websocket.Debugf("Storage: input is not a numeric client_code, input=%s: %v", clientID, scanErr)
 		return "", pgx.ErrNoRows
 	}
 
@@ -132,9 +156,10 @@ func (s *Storage) ResolveClientID(ctx context.Context, clientID string) (string,
 	`, code).Scan(&id)
 
 	if err != nil {
+		logger.Websocket.Errorf("Storage: failed to resolve client by client_code, code=%d: %v", code, err)
 		return "", err
 	}
-
+	logger.Websocket.Infof("Storage: client resolved by client_code, clientID=%s, code=%d", id, code)
 	return id, nil
 }
 
@@ -142,8 +167,11 @@ func generateClientCode() (int64, error) {
 	const min int64 = 10000000
 	const max int64 = 99999999
 
+	logger.Websocket.Debugf("Storage: generating client_code")
+
 	n, err := rand.Int(rand.Reader, big.NewInt(max-min+1))
 	if err != nil {
+		logger.Websocket.Errorf("Storage: failed to generate client_code: %v", err)
 		return 0, err
 	}
 
@@ -151,9 +179,22 @@ func generateClientCode() (int64, error) {
 }
 
 func (s *Storage) ensureClientCode(ctx context.Context, id string) (int64, error) {
+	logger.Websocket.Debugf("Storage: ensuring client_code, clientID=%s", id)
+
 	for attempts := 0; attempts < 20; attempts++ {
+		logger.Websocket.Debugf(
+			"Storage: client_code generation attempt, clientID=%s, attempt=%d",
+			id,
+			attempts+1,
+		)
+
 		code, err := generateClientCode()
 		if err != nil {
+			logger.Websocket.Errorf(
+				"Storage: failed to generate client_code for client %s: %v",
+				id,
+				err,
+			)
 			return 0, err
 		}
 
@@ -170,10 +211,19 @@ func (s *Storage) ensureClientCode(ctx context.Context, id string) (int64, error
 		`, code, id).Scan(&savedCode)
 
 		if err == nil {
+			logger.Websocket.Infof(
+				"Storage: client_code assigned, clientID=%s",
+				id,
+			)
 			return savedCode, nil
 		}
 
 		if err == pgx.ErrNoRows {
+			logger.Websocket.Debugf(
+				"Storage: client_code was not assigned, checking existing code, clientID=%s",
+				id,
+			)
+
 			var existingCode int64
 			existingErr := s.Pool.QueryRow(ctx, `
 				SELECT client_code
@@ -183,14 +233,38 @@ func (s *Storage) ensureClientCode(ctx context.Context, id string) (int64, error
 			`, id).Scan(&existingCode)
 
 			if existingErr == nil {
+				logger.Websocket.Infof(
+					"Storage: existing client_code found, clientID=%s",
+					id,
+				)
 				return existingCode, nil
 			}
 
+			if existingErr != pgx.ErrNoRows {
+				logger.Websocket.Errorf(
+					"Storage: failed to check existing client_code, clientID=%s: %v",
+					id,
+					existingErr,
+				)
+			} else {
+				logger.Websocket.Debugf(
+					"Storage: client_code collision or empty code, retrying, clientID=%s",
+					id,
+				)
+			}
 			continue
 		}
-
+		logger.Websocket.Errorf(
+			"Storage: failed to assign client_code, clientID=%s: %v",
+			id,
+			err,
+		)
 		return 0, err
 	}
-
+	logger.Websocket.Errorf(
+		"Storage: failed to generate unique client_code after attempts, clientID=%s, attempts=%d",
+		id,
+		20,
+	)
 	return 0, fmt.Errorf("failed to generate unique client_code for client %s", id)
 }

@@ -480,7 +480,17 @@ func (s *Server) handleClientHello(
 }
 
 func generateTempPass() string {
+	const chars = "abcdefghijklmnopqrstuvwxyz0123456789"
+	const passLen = 6
+
 	rand.Seed(time.Now().UnixNano())
+
+	pass := make([]byte, passLen)
+	for i := range pass {
+		pass[i] = chars[rand.Intn(len(chars))]
+	}
+
 	logger.Websocket.Debug("Temporary password generated")
-	return fmt.Sprintf("%05d", rand.Intn(100000))
+
+	return string(pass)
 }

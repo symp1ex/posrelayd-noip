@@ -145,7 +145,6 @@ func (s *Server) disconnect(
 
 		if peer != nil && peer.Role == "client" {
 			globalMu.Lock()
-			// КРИТИЧЕСКАЯ ПРАВКА: Удаляем из карты только если там лежит именно ЭТОТ объект
 			if clients[peer.ID] == peer {
 				delete(clients, peer.ID)
 				logger.Websocket.Infof("Client mapping removed: %s", peer.ID)
