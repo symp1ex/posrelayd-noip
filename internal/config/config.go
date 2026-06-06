@@ -17,8 +17,10 @@ type Config struct {
 }
 
 type ServiceConfig struct {
-	Port   int    `json:"port"`
-	APIKey string `json:"api_key"`
+	Port              int    `json:"port"`
+	AdminKey          string `json:"admin_key"`
+	ClientKey         string `json:"client_key"`
+	PassRenewalPeriod int    `json:"temp_pass_renewal_period"`
 }
 
 type DbConfig struct {
@@ -71,8 +73,10 @@ func save(cfg Config) error {
 func defaultConfig() Config {
 	return Config{
 		Service: ServiceConfig{
-			Port:   22233,
-			APIKey: "b5679e9e-b5b5-4eaf-bb99-83dba95f9f53",
+			Port:              22233,
+			ClientKey:         "b5679e9e-b5b5-4eaf-bb99-83dba95f9f53",
+			AdminKey:          "b5679e9e-b5b5-4eaf-bb99-83dba95f9f53",
+			PassRenewalPeriod: 90,
 		},
 		Db: DbConfig{
 			Host:     "192.168.0.30",

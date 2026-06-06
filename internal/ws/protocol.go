@@ -16,6 +16,7 @@ type Message struct {
 	ApiKey   string `json:"api_key,omitempty"`
 	TempPass string `json:"temp_pass,omitempty"`
 	Error    string `json:"error,omitempty"`
+	ExitCode int    `json:"exit_code,omitempty"`
 
 	// === HANDSHAKE ===
 	PublicKey   string `json:"public_key,omitempty"`

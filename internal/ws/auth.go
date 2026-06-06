@@ -40,7 +40,15 @@ var (
 	protocolViolationsMu sync.Mutex
 )
 
-const tempPassRotationInterval = 60 * time.Minute
+func tempPassRotationInterval() time.Duration {
+	period := config.Cfg.Service.PassRenewalPeriod
+
+	if period <= 0 {
+		period = 60
+	}
+
+	return time.Duration(period) * time.Minute
+}
 
 func handleClientAuth(remoteIP string, msg Message, conn *websocket.Conn, entry *PasswordEntry) bool {
 	authStateMu.Lock()
@@ -283,7 +291,7 @@ func (s *Server) handleAdminHello(
 	remoteIP string,
 	msg Message,
 ) bool {
-	if msg.ApiKey != config.Cfg.Service.APIKey {
+	if msg.ApiKey != config.Cfg.Service.AdminKey {
 
 		adminAttemptsMu.Lock()
 		adminAttempts[remoteIP]++
@@ -333,7 +341,7 @@ func (s *Server) validateClientHello(
 	remoteIP string,
 	msg Message,
 ) bool {
-	if msg.ApiKey != config.Cfg.Service.APIKey {
+	if msg.ApiKey != config.Cfg.Service.ClientKey {
 		clientAttemptsMu.Lock()
 		clientAttempts[remoteIP]++
 		attempts := clientAttempts[remoteIP]
@@ -412,14 +420,6 @@ func (s *Server) handleClientHello(
 	conn *websocket.Conn,
 	msg Message,
 ) (*Peer, bool) {
-	globalMu.Lock()
-	if oldPeer, ok := clients[msg.ID]; ok {
-		logger.Websocket.Infof("Replacing stale session for client ID: %s", msg.ID)
-		oldPeer.Close()         // Закрываем старый сокет
-		delete(clients, msg.ID) // Удаляем из списка
-	}
-	globalMu.Unlock()
-
 	peer := &Peer{
 		ID:        msg.ID,
 		Role:      "client",
@@ -505,7 +505,7 @@ func (s *Server) issueTempPass(ctx context.Context, clientID string, peer *Peer)
 }
 
 func (s *Server) startTempPassRotation(ctx context.Context, clientID string, peer *Peer) {
-	ticker := time.NewTicker(tempPassRotationInterval)
+	ticker := time.NewTicker(tempPassRotationInterval())
 	defer ticker.Stop()
 
 	for {

@@ -187,6 +187,21 @@ func (s *Server) handleHandshakeSign(
 	msg.ID = hState.clientID
 	msg.Password = hState.password
 
+	if msg.Password != "" {
+		logger.Websocket.Debugf("Handshake: password update requested for client %s", msg.ID)
+		s.handlePasswordUpdate(
+			r,
+			conn,
+			msg,
+		)
+		logger.Websocket.Debugf("Handshake: password update handler finished for client %s", msg.ID)
+		return nil, false
+	}
+
+	if rejectIfClientAlreadyOnline(conn, msg.ID) {
+		return nil, false
+	}
+
 	answer := "ok"
 	if isNew {
 		answer = "register"
@@ -207,17 +222,6 @@ func (s *Server) handleHandshakeSign(
 			hState.clientID,
 			err,
 		)
-		return nil, false
-	}
-
-	if msg.Password != "" {
-		logger.Websocket.Debugf("Handshake: password update requested for client %s", msg.ID)
-		s.handlePasswordUpdate(
-			r,
-			conn,
-			msg,
-		)
-		logger.Websocket.Debugf("Handshake: password update handler finished for client %s", msg.ID)
 		return nil, false
 	}
 
@@ -323,4 +327,35 @@ func (s *Server) verifyHandshakeSign(peerState *handshakeState, msg Message) (bo
 		isNew,
 	)
 	return true, isNew
+}
+
+func rejectIfClientAlreadyOnline(conn *websocket.Conn, clientID string) bool {
+	globalMu.Lock()
+	_, online := clients[clientID]
+	globalMu.Unlock()
+
+	if !online {
+		return false
+	}
+
+	logger.Websocket.Warnf(
+		"Rejected duplicate client connection: client_id=%s already online",
+		clientID,
+	)
+
+	_ = conn.WriteJSON(Message{
+		Type:     "error",
+		Error:    "Client with this id is already online",
+		ExitCode: 1,
+	})
+
+	_ = conn.WriteMessage(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(
+			websocket.ClosePolicyViolation,
+			"client already online",
+		),
+	)
+
+	return true
 }
