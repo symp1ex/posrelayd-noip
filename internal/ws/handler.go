@@ -10,6 +10,15 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+func writeOrEnqueue(conn *websocket.Conn, peer *Peer, msg Message) {
+	if peer != nil {
+		peer.Enqueue(msg)
+		return
+	}
+
+	_ = conn.WriteJSON(msg)
+}
+
 func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 	remoteIP := getClientIP(r)
 
@@ -104,14 +113,14 @@ func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 
 				if attempts >= 3 {
 					_ = db.AddToBlacklist(context.Background(), remoteIP)
-					_ = conn.WriteJSON(Message{
+					writeOrEnqueue(conn, peer, Message{
 						Type:  "error",
 						Error: "Your IP is banned due to protocol violations",
 					})
 					return
 				}
 
-				_ = conn.WriteJSON(Message{
+				writeOrEnqueue(conn, peer, Message{
 					Type:  "error",
 					Error: "Authentication required",
 				})
@@ -124,7 +133,7 @@ func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 			case "register", "auth":
 				// разрешено
 			default:
-				_ = conn.WriteJSON(Message{
+				writeOrEnqueue(conn, peer, Message{
 					Type:  "error",
 					Error: "Registration required",
 				})
@@ -139,7 +148,7 @@ func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			authenticated = true
-			_ = conn.WriteJSON(Message{
+			writeOrEnqueue(conn, peer, Message{
 				Type: "admin_hello_ok",
 			})
 
@@ -160,7 +169,7 @@ func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 			authenticated = true
 			sessions[msg.ID] = clientID // сохраняем, чтобы знать, к какому клиенту привязывать админа
 
-			_ = conn.WriteJSON(Message{
+			writeOrEnqueue(conn, peer, Message{
 				Type:     "auth_ok",
 				ClientID: msg.ClientID,
 			})
@@ -198,11 +207,11 @@ func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 			// Выполняем логику рукопожатия
 			ok, reason := s.handleHandshake(r, hState, msg)
 			if !ok {
-				_ = conn.WriteJSON(Message{Type: "handshake", Answer: "fail", Description: reason})
+				writeOrEnqueue(conn, peer, Message{Type: "handshake", Answer: "fail", Description: reason})
 				return // Закрываем соединение при провале
 			}
 
-			_ = conn.WriteJSON(Message{
+			writeOrEnqueue(conn, peer, Message{
 				Type:      "handshake",
 				Answer:    "check",
 				Challenge: hState.challenge,
@@ -253,7 +262,7 @@ func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 			if attempts >= 3 {
 				_ = db.AddToBlacklist(context.Background(), remoteIP)
 
-				_ = conn.WriteJSON(Message{
+				writeOrEnqueue(conn, peer, Message{
 					Type:  "error",
 					Error: "Your IP is banned due to protocol violations",
 				})
@@ -261,7 +270,7 @@ func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			_ = conn.WriteJSON(Message{
+			writeOrEnqueue(conn, peer, Message{
 				Type: "error",
 				Error: fmt.Sprintf(
 					"Unknown request type '%s' (%d/3)",

@@ -40,6 +40,8 @@ var (
 	protocolViolationsMu sync.Mutex
 )
 
+const tempPassRotationInterval = 60 * time.Minute
+
 func handleClientAuth(remoteIP string, msg Message, conn *websocket.Conn, entry *PasswordEntry) bool {
 	authStateMu.Lock()
 
@@ -418,30 +420,6 @@ func (s *Server) handleClientHello(
 	}
 	globalMu.Unlock()
 
-	plainTemp := generateTempPass()
-
-	encryptedTemp, err := crypto.Encrypt(plainTemp)
-	if err != nil {
-		_ = conn.WriteJSON(Message{
-			Type:  "error",
-			Error: "Temp password encryption failed",
-		})
-		return nil, false
-	}
-
-	clientData, _ := db.GetClient(r.Context(), msg.ID)
-	currPass := ""
-	if clientData != nil {
-		currPass = clientData.Password
-	}
-
-	err = db.UpsertClient(r.Context(), msg.ID, currPass, encryptedTemp)
-	if err != nil {
-		logger.Websocket.Errorf("DB: Error saving client temporary password %s: %v", msg.ID, err)
-	} else {
-		logger.Websocket.Debugf("DB: Temporary password for %s saved", msg.ID)
-	}
-
 	peer := &Peer{
 		ID:        msg.ID,
 		Role:      "client",
@@ -461,22 +439,89 @@ func (s *Server) handleClientHello(
 		msg.ID,
 	)
 
-	clientData, _ = db.GetClient(r.Context(), msg.ID)
+	ctx := context.Background()
 
-	// ОТПРАВЛЯЕМ temp_pass PY-КЛИЕНТУ
-	_ = conn.WriteJSON(Message{
-		Type:     "temp_pass",
-		TempPass: plainTemp,
-	})
+	if !s.issueTempPass(ctx, msg.ID, peer) {
+		globalMu.Lock()
+		if clients[peer.ID] == peer {
+			delete(clients, peer.ID)
+		}
+		globalMu.Unlock()
 
+		peer.Close()
+		return nil, false
+	}
+
+	clientData, _ := db.GetClient(ctx, msg.ID)
 	if clientData != nil {
-		_ = conn.WriteJSON(Message{
+		peer.Enqueue(Message{
 			Type:       "client_code",
 			ClientCode: clientData.ClientCode,
 		})
 	}
 
+	go s.startTempPassRotation(ctx, msg.ID, peer)
+
 	return peer, true
+}
+
+func (s *Server) issueTempPass(ctx context.Context, clientID string, peer *Peer) bool {
+	plainTemp := generateTempPass()
+
+	encryptedTemp, err := crypto.Encrypt(plainTemp)
+	if err != nil {
+		peer.Enqueue(Message{
+			Type:  "error",
+			Error: "Temp password encryption failed",
+		})
+		return false
+	}
+
+	clientData, _ := db.GetClient(ctx, clientID)
+
+	currPass := ""
+	if clientData != nil {
+		currPass = clientData.Password
+	}
+
+	err = db.UpsertClient(ctx, clientID, currPass, encryptedTemp)
+	if err != nil {
+		logger.Websocket.Errorf(
+			"DB: Error saving client temporary password %s: %v",
+			clientID,
+			err,
+		)
+		return false
+	}
+
+	logger.Websocket.Debugf("DB: Temporary password for %s saved/rotated", clientID)
+
+	peer.Enqueue(Message{
+		Type:     "temp_pass",
+		TempPass: plainTemp,
+	})
+
+	return true
+}
+
+func (s *Server) startTempPassRotation(ctx context.Context, clientID string, peer *Peer) {
+	ticker := time.NewTicker(tempPassRotationInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.issueTempPass(ctx, clientID, peer)
+
+		case <-peer.done:
+			logger.Websocket.Debugf("Temp password rotation stopped for client %s", clientID)
+			return
+
+		case <-ctx.Done():
+			logger.Websocket.Debugf("Temp password rotation context cancelled for client %s", clientID)
+			return
+		}
+	}
 }
 
 func generateTempPass() string {
