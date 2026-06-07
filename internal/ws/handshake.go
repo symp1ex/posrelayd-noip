@@ -70,8 +70,9 @@ func (s *Server) handleHandshake(r *http.Request, peerState *handshakeState, msg
 		}
 		// Если записи нет - создаем (UUID + пустые пассы)
 		if dbClient == nil {
+			currPass := ""
 			logger.Websocket.Infof("Handshake: creating DB record for new client %s", msg.ID)
-			if upsertClientErr := db.UpsertClient(ctx, msg.ID, "", ""); upsertClientErr != nil {
+			if upsertClientErr := db.UpsertClient(ctx, msg.ID, currPass, ""); upsertClientErr != nil {
 				logger.Websocket.Errorf(
 					"Handshake: failed to create DB record for client %s: %v",
 					msg.ID,
