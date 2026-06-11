@@ -53,22 +53,28 @@ func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 	conn.SetReadLimit(512 * 1024)
 	conn.SetReadDeadline(time.Now().Add(waitTimeout))
 
+	var peer *Peer
+	authenticated := false
+	hState := &handshakeState{}
+
 	// 1. Когда сервер пингует клиента, клиент присылает PONG
 	conn.SetPongHandler(func(string) error {
 		conn.SetReadDeadline(time.Now().Add(waitTimeout))
+		if peer != nil {
+			peer.Touch()
+		}
 		return nil
 	})
 
 	// 2. Когда клиент пингует сервер, сервер получает PING
 	conn.SetPingHandler(func(appData string) error {
 		conn.SetReadDeadline(time.Now().Add(waitTimeout))
+		if peer != nil {
+			peer.Touch()
+		}
 		// Обязательно отвечаем клиенту, иначе он подумает, что сервер умер
 		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(5*time.Second))
 	})
-
-	var peer *Peer
-	authenticated := false
-	hState := &handshakeState{}
 
 	defer func() {
 		s.disconnect(peer, conn, remoteIP)
@@ -86,6 +92,10 @@ func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		conn.SetReadDeadline(time.Now().Add(waitTimeout))
+
+		if peer != nil {
+			peer.Touch()
+		}
 
 		logger.Websocket.Debugf(
 			"Incoming message from %s: type=%s id=%s role=%s client_id=%s",

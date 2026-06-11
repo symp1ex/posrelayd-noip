@@ -16,6 +16,8 @@ import (
 	"posrelayd-noip/internal/logger"
 )
 
+const clientStaleAfter = 90 * time.Second
+
 type AuthState struct {
 	Attempts int
 	Blocked  time.Time
@@ -225,8 +227,9 @@ func (s *Server) handleRegister(
 		ID:        msg.ID,
 		Role:      msg.Role,
 		Conn:      conn,
-		sendQueue: make(chan OutboundMessage, 32),
+		sendQueue: make(chan OutboundMessage, 256),
 		done:      make(chan struct{}),
+		lastSeen:  time.Now(),
 	}
 
 	logger.Websocket.Infof(
@@ -421,22 +424,28 @@ func (s *Server) handleClientHello(
 	msg Message,
 ) (*Peer, bool) {
 	peer := &Peer{
-		ID:        msg.ID,
-		Role:      "client",
-		Conn:      conn,
-		sendQueue: make(chan OutboundMessage, 32),
-		done:      make(chan struct{}),
+		ID:         msg.ID,
+		Role:       "client",
+		InstanceID: msg.InstanceID,
+		Conn:       conn,
+		sendQueue:  make(chan OutboundMessage, 256),
+		done:       make(chan struct{}),
+		lastSeen:   time.Now(),
 	}
+
 	peer.StartWriter()
 	peer.StartPing(30 * time.Second)
 
-	globalMu.Lock()
-	clients[peer.ID] = peer
-	globalMu.Unlock()
+	if !registerClientPeer(conn, peer) {
+		peer.Close()
+		return nil, false
+	}
 
 	logger.Websocket.Infof(
-		"Client connected: %s",
+		"Client connected: %s instance_id=%s legacy=%t",
 		msg.ID,
+		msg.InstanceID,
+		msg.InstanceID == "",
 	)
 
 	ctx := context.Background()
@@ -463,6 +472,77 @@ func (s *Server) handleClientHello(
 	go s.startTempPassRotation(ctx, msg.ID, peer)
 
 	return peer, true
+}
+
+func registerClientPeer(conn *websocket.Conn, newPeer *Peer) bool {
+	globalMu.Lock()
+	oldPeer := clients[newPeer.ID]
+
+	if oldPeer == nil {
+		clients[newPeer.ID] = newPeer
+		globalMu.Unlock()
+
+		logger.Websocket.Infof(
+			"Client registered: client_id=%s instance_id=%s legacy=%t",
+			newPeer.ID,
+			newPeer.InstanceID,
+			newPeer.InstanceID == "",
+		)
+
+		return true
+	}
+
+	sameInstance :=
+		newPeer.InstanceID != "" &&
+			oldPeer.InstanceID != "" &&
+			newPeer.InstanceID == oldPeer.InstanceID
+
+	stale := time.Since(oldPeer.LastSeen()) > clientStaleAfter
+
+	if sameInstance || stale {
+		clients[newPeer.ID] = newPeer
+		globalMu.Unlock()
+
+		logger.Websocket.Warnf(
+			"Client takeover: client_id=%s same_instance=%t stale=%t old_instance_id=%s new_instance_id=%s",
+			newPeer.ID,
+			sameInstance,
+			stale,
+			oldPeer.InstanceID,
+			newPeer.InstanceID,
+		)
+
+		oldPeer.Close()
+		_ = oldPeer.Conn.Close()
+
+		return true
+	}
+
+	globalMu.Unlock()
+
+	logger.Websocket.Warnf(
+		"Rejected duplicate client connection: client_id=%s old_instance_id=%s new_instance_id=%s legacy=%t",
+		newPeer.ID,
+		oldPeer.InstanceID,
+		newPeer.InstanceID,
+		newPeer.InstanceID == "",
+	)
+
+	_ = conn.WriteJSON(Message{
+		Type:     "error",
+		Error:    "Client with this id is already online",
+		ExitCode: 1,
+	})
+
+	_ = conn.WriteMessage(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(
+			websocket.ClosePolicyViolation,
+			"client already online",
+		),
+	)
+
+	return false
 }
 
 func (s *Server) issueTempPass(ctx context.Context, clientID string, peer *Peer) bool {

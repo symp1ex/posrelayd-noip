@@ -1,6 +1,7 @@
 package ws
 
 import (
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -8,14 +9,30 @@ import (
 )
 
 type Peer struct {
-	ID   string
-	Role string // "admin" or "client"
-	Conn *websocket.Conn
+	ID         string
+	Role       string // "admin" or "client"
+	InstanceID string
+	Conn       *websocket.Conn
 
 	sendQueue chan OutboundMessage
 	pingDone  chan struct{}
 
 	done chan struct{}
+
+	mu       sync.Mutex
+	lastSeen time.Time
+}
+
+func (p *Peer) Touch() {
+	p.mu.Lock()
+	p.lastSeen = time.Now()
+	p.mu.Unlock()
+}
+
+func (p *Peer) LastSeen() time.Time {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lastSeen
 }
 
 func (p *Peer) StartWriter() {
@@ -45,6 +62,8 @@ func (p *Peer) StartWriter() {
 								out.JSON.Type,
 								err,
 							)
+							p.Close()
+							_ = p.Conn.Close()
 							return
 						}
 
@@ -62,6 +81,8 @@ func (p *Peer) StartWriter() {
 							p.ID,
 							err,
 						)
+						p.Close()
+						_ = p.Conn.Close()
 						return
 					}
 				}

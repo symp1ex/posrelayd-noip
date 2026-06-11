@@ -4,6 +4,7 @@ type Message struct {
 	Type       string                 `json:"type"`
 	ClientID   string                 `json:"client_id,omitempty"`
 	ClientCode int64                  `json:"client_code,omitempty"`
+	InstanceID string                 `json:"instance_id,omitempty"`
 	CommandID  string                 `json:"command_id,omitempty"`
 	Command    string                 `json:"command,omitempty"`
 	Prompt     string                 `json:"prompt,omitempty"`

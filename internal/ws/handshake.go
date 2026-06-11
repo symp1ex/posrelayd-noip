@@ -15,10 +15,11 @@ import (
 
 // Состояние для конкретного соединения во время рукопожатия
 type handshakeState struct {
-	clientID  string
-	publicKey string
-	challenge string
-	password  string
+	clientID   string
+	publicKey  string
+	challenge  string
+	password   string
+	instanceID string
 }
 
 func (s *Server) handleHandshake(r *http.Request, peerState *handshakeState, msg Message) (bool, string) {
@@ -114,6 +115,7 @@ func (s *Server) handleHandshake(r *http.Request, peerState *handshakeState, msg
 	peerState.publicKey = msg.PublicKey
 	peerState.challenge = hex.EncodeToString(chal)
 	peerState.password = msg.Password
+	peerState.instanceID = msg.InstanceID
 
 	logger.Websocket.Infof("Handshake: challenge prepared for client %s", msg.ID)
 
@@ -187,6 +189,7 @@ func (s *Server) handleHandshakeSign(
 
 	msg.ID = hState.clientID
 	msg.Password = hState.password
+	msg.InstanceID = hState.instanceID
 
 	if msg.Password != "" {
 		logger.Websocket.Debugf("Handshake: password update requested for client %s", msg.ID)
@@ -196,10 +199,6 @@ func (s *Server) handleHandshakeSign(
 			msg,
 		)
 		logger.Websocket.Debugf("Handshake: password update handler finished for client %s", msg.ID)
-		return nil, false
-	}
-
-	if rejectIfClientAlreadyOnline(conn, msg.ID) {
 		return nil, false
 	}
 
@@ -328,35 +327,4 @@ func (s *Server) verifyHandshakeSign(peerState *handshakeState, msg Message) (bo
 		isNew,
 	)
 	return true, isNew
-}
-
-func rejectIfClientAlreadyOnline(conn *websocket.Conn, clientID string) bool {
-	globalMu.Lock()
-	_, online := clients[clientID]
-	globalMu.Unlock()
-
-	if !online {
-		return false
-	}
-
-	logger.Websocket.Warnf(
-		"Rejected duplicate client connection: client_id=%s already online",
-		clientID,
-	)
-
-	_ = conn.WriteJSON(Message{
-		Type:     "error",
-		Error:    "Client with this id is already online",
-		ExitCode: 1,
-	})
-
-	_ = conn.WriteMessage(
-		websocket.CloseMessage,
-		websocket.FormatCloseMessage(
-			websocket.ClosePolicyViolation,
-			"client already online",
-		),
-	)
-
-	return true
 }
