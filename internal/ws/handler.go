@@ -10,6 +10,8 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+const handshakeSignTimeout = 15 * time.Second
+
 func writeOrEnqueue(conn *websocket.Conn, peer *Peer, msg Message) {
 	if peer != nil {
 		peer.Enqueue(msg)
@@ -57,9 +59,14 @@ func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 	authenticated := false
 	hState := &handshakeState{}
 
+	waitingHandshakeSign := false
+	handshakeSignDeadline := time.Time{}
+
 	// 1. Когда сервер пингует клиента, клиент присылает PONG
 	conn.SetPongHandler(func(string) error {
-		conn.SetReadDeadline(time.Now().Add(waitTimeout))
+		if !waitingHandshakeSign {
+			conn.SetReadDeadline(time.Now().Add(waitTimeout))
+		}
 		if peer != nil {
 			peer.Touch()
 		}
@@ -68,12 +75,17 @@ func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 
 	// 2. Когда клиент пингует сервер, сервер получает PING
 	conn.SetPingHandler(func(appData string) error {
-		conn.SetReadDeadline(time.Now().Add(waitTimeout))
+		if !waitingHandshakeSign {
+			conn.SetReadDeadline(time.Now().Add(waitTimeout))
+		}
 		if peer != nil {
 			peer.Touch()
 		}
-		// Обязательно отвечаем клиенту, иначе он подумает, что сервер умер
-		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(5*time.Second))
+		return conn.WriteControl(
+			websocket.PongMessage,
+			[]byte(appData),
+			time.Now().Add(5*time.Second),
+		)
 	})
 
 	defer func() {
@@ -83,10 +95,35 @@ func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 	for {
 		var msg Message
 		if err := conn.ReadJSON(&msg); err != nil {
-			logger.Websocket.Warnf(
-				"ReadJSON failed from %s: %v",
-				remoteIP, err,
-			)
+			if waitingHandshakeSign {
+				logger.Websocket.Warnf(
+					"Client disconnected because it did not respond to handshake: client_id=%s instance_id=%s remote_ip=%s timeout=%s err=%v",
+					hState.clientID,
+					hState.instanceID,
+					remoteIP,
+					handshakeSignTimeout,
+					err,
+				)
+				_ = conn.WriteJSON(Message{
+					Type:  "error",
+					Error: "Handshake timeout: client did not send sign",
+				})
+
+				_ = conn.WriteMessage(
+					websocket.CloseMessage,
+					websocket.FormatCloseMessage(
+						websocket.ClosePolicyViolation,
+						"handshake timeout",
+					),
+				)
+			} else {
+				logger.Websocket.Warnf(
+					"ReadJSON failed from %s: %v",
+					remoteIP,
+					err,
+				)
+			}
+
 			conn.SetReadDeadline(time.Now().Add(waitTimeout))
 			return
 		}
@@ -227,12 +264,20 @@ func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 				Challenge: hState.challenge,
 			})
 
+			waitingHandshakeSign = true
+			handshakeSignDeadline = time.Now().Add(handshakeSignTimeout)
+			conn.SetReadDeadline(handshakeSignDeadline)
+
 			logger.Websocket.Debugf(
 				"Handshake challenge sent to client %s",
 				msg.ID,
 			)
 
 		case "sign":
+			waitingHandshakeSign = false
+			handshakeSignDeadline = time.Time{}
+			conn.SetReadDeadline(time.Now().Add(waitTimeout))
+
 			newPeer, ok := s.handleHandshakeSign(
 				r,
 				conn,

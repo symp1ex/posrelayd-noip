@@ -16,7 +16,11 @@ import (
 	"posrelayd-noip/internal/logger"
 )
 
-const clientStaleAfter = 90 * time.Second
+const (
+	clientStaleAfter             = 90 * time.Second
+	duplicateClientCheckAttempts = 10
+	duplicateClientCheckDelay    = 15 * time.Second
+)
 
 type AuthState struct {
 	Attempts int
@@ -475,73 +479,94 @@ func (s *Server) handleClientHello(
 }
 
 func registerClientPeer(conn *websocket.Conn, newPeer *Peer) bool {
-	globalMu.Lock()
-	oldPeer := clients[newPeer.ID]
+	for attempt := 1; attempt <= duplicateClientCheckAttempts; attempt++ {
+		globalMu.Lock()
+		oldPeer := clients[newPeer.ID]
 
-	if oldPeer == nil {
-		clients[newPeer.ID] = newPeer
-		globalMu.Unlock()
+		if oldPeer == nil {
+			clients[newPeer.ID] = newPeer
+			globalMu.Unlock()
 
-		logger.Websocket.Infof(
-			"Client registered: client_id=%s instance_id=%s legacy=%t",
-			newPeer.ID,
-			newPeer.InstanceID,
-			newPeer.InstanceID == "",
-		)
+			logger.Websocket.Infof(
+				"Client registered: client_id=%s instance_id=%s legacy=%t",
+				newPeer.ID,
+				newPeer.InstanceID,
+				newPeer.InstanceID == "",
+			)
 
-		return true
-	}
+			return true
+		}
 
-	sameInstance :=
-		newPeer.InstanceID != "" &&
-			oldPeer.InstanceID != "" &&
-			newPeer.InstanceID == oldPeer.InstanceID
+		sameInstance :=
+			newPeer.InstanceID != "" &&
+				oldPeer.InstanceID != "" &&
+				newPeer.InstanceID == oldPeer.InstanceID
 
-	stale := time.Since(oldPeer.LastSeen()) > clientStaleAfter
+		stale := time.Since(oldPeer.LastSeen()) > clientStaleAfter
 
-	if sameInstance || stale {
-		clients[newPeer.ID] = newPeer
+		if sameInstance || stale {
+			clients[newPeer.ID] = newPeer
+			globalMu.Unlock()
+
+			logger.Websocket.Warnf(
+				"Client takeover: client_id=%s same_instance=%t stale=%t old_instance_id=%s new_instance_id=%s",
+				newPeer.ID,
+				sameInstance,
+				stale,
+				oldPeer.InstanceID,
+				newPeer.InstanceID,
+			)
+
+			oldPeer.Close()
+			_ = oldPeer.Conn.Close()
+
+			return true
+		}
+
+		oldInstanceID := oldPeer.InstanceID
+		newInstanceID := newPeer.InstanceID
 		globalMu.Unlock()
 
 		logger.Websocket.Warnf(
-			"Client takeover: client_id=%s same_instance=%t stale=%t old_instance_id=%s new_instance_id=%s",
+			"Duplicate client connection attempt %d/%d: client_id=%s old_instance_id=%s new_instance_id=%s legacy=%t",
+			attempt,
+			duplicateClientCheckAttempts,
 			newPeer.ID,
-			sameInstance,
-			stale,
-			oldPeer.InstanceID,
-			newPeer.InstanceID,
+			oldInstanceID,
+			newInstanceID,
+			newPeer.InstanceID == "",
 		)
 
-		oldPeer.Close()
-		_ = oldPeer.Conn.Close()
+		if attempt < duplicateClientCheckAttempts {
+			_ = conn.WriteJSON(Message{
+				Type: "error",
+				Error: fmt.Sprintf(
+					"Client with this id is already online, retrying duplicate check (%d/%d)",
+					attempt,
+					duplicateClientCheckAttempts,
+				),
+			})
 
-		return true
+			time.Sleep(duplicateClientCheckDelay)
+			continue
+		}
+
+		_ = conn.WriteJSON(Message{
+			Type:     "error",
+			Error:    "Client with this id is already online",
+			ExitCode: 1,
+		})
+
+		_ = conn.WriteMessage(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(
+				websocket.ClosePolicyViolation,
+				"client already online",
+			),
+		)
+
+		return false
 	}
-
-	globalMu.Unlock()
-
-	logger.Websocket.Warnf(
-		"Rejected duplicate client connection: client_id=%s old_instance_id=%s new_instance_id=%s legacy=%t",
-		newPeer.ID,
-		oldPeer.InstanceID,
-		newPeer.InstanceID,
-		newPeer.InstanceID == "",
-	)
-
-	_ = conn.WriteJSON(Message{
-		Type:     "error",
-		Error:    "Client with this id is already online",
-		ExitCode: 1,
-	})
-
-	_ = conn.WriteMessage(
-		websocket.CloseMessage,
-		websocket.FormatCloseMessage(
-			websocket.ClosePolicyViolation,
-			"client already online",
-		),
-	)
-
 	return false
 }
 
