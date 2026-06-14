@@ -8,6 +8,8 @@ import (
 	"posrelayd-noip/internal/logger"
 )
 
+const writeTimeout = 25 * time.Second
+
 type Peer struct {
 	ID         string
 	Role       string // "admin" or "client"
@@ -17,7 +19,8 @@ type Peer struct {
 	sendQueue chan OutboundMessage
 	pingDone  chan struct{}
 
-	done chan struct{}
+	done      chan struct{}
+	closeOnce sync.Once
 
 	mu       sync.Mutex
 	lastSeen time.Time
@@ -55,6 +58,8 @@ func (p *Peer) StartWriter() {
 				switch out.Kind {
 				case OutboundJSON:
 					if out.JSON != nil {
+						_ = p.Conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+
 						if err := p.Conn.WriteJSON(out.JSON); err != nil {
 							logger.Websocket.Warnf(
 								"WriteJSON failed (peer=%s type=%s): %v",
@@ -75,6 +80,8 @@ func (p *Peer) StartWriter() {
 					}
 
 				case OutboundPing:
+					_ = p.Conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+
 					if err := p.Conn.WriteMessage(websocket.PingMessage, out.Ping); err != nil {
 						logger.Websocket.Warnf(
 							"Ping failed (peer=%s): %v",
@@ -98,41 +105,47 @@ func (p *Peer) StartWriter() {
 	}()
 }
 
-func (p *Peer) Enqueue(msg Message) {
-	logger.Websocket.Debugf(
-		"Message enqueued (peer=%s type=%s)",
-		p.ID, msg.Type,
-	)
-
+func (p *Peer) Enqueue(msg Message) bool {
 	select {
+	case <-p.done:
+		logger.Websocket.Warnf(
+			"Enqueue dropped message (peer=%s type=%s): peer closed",
+			p.ID,
+			msg.Type,
+		)
+		return false
+
 	case p.sendQueue <- OutboundMessage{
 		Kind: OutboundJSON,
 		JSON: &msg,
 	}:
-	case <-p.done:
-		logger.Websocket.Warnf(
-			"Enqueue dropped message (peer=%s type=%s): peer closed",
-			p.ID, msg.Type,
+		logger.Websocket.Debugf(
+			"Message enqueued (peer=%s type=%s)",
+			p.ID,
+			msg.Type,
 		)
+		return true
+
+	default:
+		logger.Websocket.Warnf(
+			"Enqueue dropped message (peer=%s type=%s): send queue full",
+			p.ID,
+			msg.Type,
+		)
+		return false
 	}
 }
 
 func (p *Peer) Close() {
-	select {
-	case <-p.done:
-		logger.Websocket.Debugf(
-			"Peer already closed: %s",
-			p.ID,
-		)
-		return
-	default:
+	p.closeOnce.Do(func() {
 		logger.Websocket.Infof(
 			"Closing peer: %s role=%s",
-			p.ID, p.Role,
+			p.ID,
+			p.Role,
 		)
+
 		close(p.done)
-		close(p.sendQueue)
-	}
+	})
 }
 
 func (p *Peer) StartPing(interval time.Duration) {

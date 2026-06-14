@@ -95,7 +95,10 @@ func (s *Server) handleSessionClosed(msg Message) {
 			"Session close requested, but admin not found: admin_id=%s",
 			adminID,
 		)
+	} else {
+		delete(sessions, adminID)
 	}
+
 	globalMu.Unlock()
 
 	if admin != nil {
@@ -103,7 +106,6 @@ func (s *Server) handleSessionClosed(msg Message) {
 			Type:  "session_closed",
 			Error: "CMD session terminated on client",
 		})
-		delete(sessions, adminID)
 
 		logger.Websocket.Infof(
 			"Session closed: admin_id=%s (initiated by client)",
@@ -130,21 +132,42 @@ func (s *Server) disconnect(
 			peer.Close()
 		}
 
+		var notifications []struct {
+			peer *Peer
+			msg  Message
+		}
+
 		if peer != nil && peer.Role == "admin" {
 			globalMu.Lock()
+
 			if clientID, ok := sessions[peer.ID]; ok {
 				if client, ok := clients[clientID]; ok {
-					client.Enqueue(Message{Type: "admin_detach", ID: peer.ID})
+					notifications = append(notifications, struct {
+						peer *Peer
+						msg  Message
+					}{
+						peer: client,
+						msg:  Message{Type: "admin_detach", ID: peer.ID},
+					})
 				}
+
 				delete(sessions, peer.ID)
 			}
+
 			delete(admins, peer.ID)
+
 			globalMu.Unlock()
+
+			for _, n := range notifications {
+				n.peer.Enqueue(n.msg)
+			}
+
 			logger.Websocket.Infof("Admin disconnected: %v", peer.ID)
 		}
 
 		if peer != nil && peer.Role == "client" {
 			globalMu.Lock()
+
 			if clients[peer.ID] == peer {
 				delete(clients, peer.ID)
 				logger.Websocket.Infof("Client mapping removed: %s", peer.ID)
@@ -153,14 +176,32 @@ func (s *Server) disconnect(
 			for adminID, clientID := range sessions {
 				if clientID == peer.ID {
 					if admin, ok := admins[adminID]; ok {
-						admin.Enqueue(Message{Type: "session_closed", ClientID: peer.ID, Error: "Client disconnected"})
+						notifications = append(notifications, struct {
+							peer *Peer
+							msg  Message
+						}{
+							peer: admin,
+							msg: Message{
+								Type:     "session_closed",
+								ClientID: peer.ID,
+								Error:    "Client disconnected",
+							},
+						})
 					}
+
 					delete(sessions, adminID)
 				}
 			}
+
 			globalMu.Unlock()
+
+			for _, n := range notifications {
+				n.peer.Enqueue(n.msg)
+			}
+
 			logger.Websocket.Infof("Client disconnected: %v", peer.ID)
 		}
+
 		conn.Close()
 	}()
 }
