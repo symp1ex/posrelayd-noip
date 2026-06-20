@@ -252,7 +252,8 @@ func (s *Server) handleRegister(
 	if peer.Role == "admin" {
 		admins[peer.ID] = peer
 
-		client := sessions[msg.ID]
+		sessionID := msg.ID
+		client := sessions[sessionID]
 
 		if client != "" {
 			var ok bool

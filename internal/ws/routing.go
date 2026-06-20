@@ -6,24 +6,24 @@ import (
 )
 
 func (s *Server) handleCommand(msg Message) {
-	adminID := msg.ID
+	sessionID := msg.ID
 	targetClientID := msg.ClientID
 
 	globalMu.Lock()
 
-	if boundClientID, ok := sessions[adminID]; ok && boundClientID != "" {
+	if boundClientID, ok := sessions[sessionID]; ok && boundClientID != "" {
 		targetClientID = boundClientID
 	}
 
 	client := clients[targetClientID]
-	admin := admins[adminID]
+	admin := admins[sessionID]
 
 	globalMu.Unlock()
 
 	logger.Websocket.Debugf(
-		"Routing %s from admin=%s to client=%s requested_client_id=%s (cmd_id=%s)",
+		"Routing %s from session_id=%s to client=%s requested_client_id=%s (cmd_id=%s)",
 		msg.Type,
-		adminID,
+		sessionID,
 		targetClientID,
 		msg.ClientID,
 		msg.CommandID,
@@ -31,8 +31,8 @@ func (s *Server) handleCommand(msg Message) {
 
 	if client == nil {
 		logger.Websocket.Warnf(
-			"Routing dropped: target client not found admin=%s requested_client_id=%s resolved_client_id=%s cmd_id=%s",
-			adminID,
+			"Routing dropped: target client not found session_id=%s requested_client_id=%s resolved_client_id=%s cmd_id=%s",
+			sessionID,
 			msg.ClientID,
 			targetClientID,
 			msg.CommandID,
@@ -55,19 +55,19 @@ func (s *Server) handleCommand(msg Message) {
 		ClientID:  targetClientID,
 		CommandID: msg.CommandID,
 		Command:   msg.Command,
-		ID:        adminID,
+		ID:        sessionID,
 	})
 }
 
 func (s *Server) handleResult(msg Message) {
-	adminID := msg.ID
+	sessionID := msg.ID
 
 	globalMu.Lock()
-	admin := admins[adminID]
+	admin := admins[sessionID]
 	globalMu.Unlock()
 
 	logger.Websocket.Debugf(
-		"Routing %s from %s to client %s (cmd_id=%s)",
+		"Routing %s from session_id=%s to client %s (cmd_id=%s)",
 		msg.Type,
 		msg.ID,
 		msg.ClientID,
@@ -81,22 +81,22 @@ func (s *Server) handleResult(msg Message) {
 
 func (s *Server) handleSessionClosed(msg Message) {
 	logger.Websocket.Infof(
-		"Session close requested by client: admin_id=%s",
+		"Session close requested by client: session_id=%s",
 		msg.ID,
 	)
 
-	adminID := msg.ID
+	sessionID := msg.ID
 
 	globalMu.Lock()
-	admin := admins[adminID]
+	admin := admins[sessionID]
 
 	if admin == nil {
 		logger.Websocket.Warnf(
-			"Session close requested, but admin not found: admin_id=%s",
-			adminID,
+			"Session close requested, but admin not found: sessionID=%s",
+			sessionID,
 		)
 	} else {
-		delete(sessions, adminID)
+		delete(sessions, sessionID)
 	}
 
 	globalMu.Unlock()
@@ -108,8 +108,8 @@ func (s *Server) handleSessionClosed(msg Message) {
 		})
 
 		logger.Websocket.Infof(
-			"Session closed: admin_id=%s (initiated by client)",
-			adminID,
+			"Session closed: session_id=%s (initiated by client)",
+			sessionID,
 		)
 	}
 }
@@ -173,9 +173,9 @@ func (s *Server) disconnect(
 				logger.Websocket.Infof("Client mapping removed: %s", peer.ID)
 			}
 
-			for adminID, clientID := range sessions {
+			for sessionID, clientID := range sessions {
 				if clientID == peer.ID {
-					if admin, ok := admins[adminID]; ok {
+					if admin, ok := admins[sessionID]; ok {
 						notifications = append(notifications, struct {
 							peer *Peer
 							msg  Message
@@ -189,7 +189,7 @@ func (s *Server) disconnect(
 						})
 					}
 
-					delete(sessions, adminID)
+					delete(sessions, sessionID)
 				}
 			}
 

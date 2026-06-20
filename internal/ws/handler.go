@@ -214,7 +214,7 @@ func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			authenticated = true
-			sessions[msg.ID] = clientID // сохраняем, чтобы знать, к какому клиенту привязывать админа
+			sessions[msg.ID] = clientID // сохраняем session_id -> client_id для последующего register
 
 			writeOrEnqueue(conn, peer, Message{
 				Type:     "auth_ok",
