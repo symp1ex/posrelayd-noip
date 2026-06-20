@@ -1,10 +1,8 @@
 package ws
 
 import (
-	"net/http"
-	"sync"
-
 	"github.com/gorilla/websocket"
+	"net/http"
 
 	"posrelayd-noip/internal/storage"
 )
@@ -17,19 +15,16 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
-var (
-	admins   = make(map[string]*Peer)
-	clients  = make(map[string]*Peer)
-	sessions = make(map[string]string)
-
-	globalMu sync.Mutex
-)
-
-type Server struct{}
+type Server struct {
+	sessions *SessionManager
+}
 
 func NewServer(storageDB *storage.Storage) *Server {
 	db = storageDB
-	return &Server{}
+
+	return &Server{
+		sessions: NewSessionManager(),
+	}
 }
 
 func (s *Server) Handler(

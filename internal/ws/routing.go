@@ -9,16 +9,7 @@ func (s *Server) handleCommand(msg Message) {
 	sessionID := msg.ID
 	targetClientID := msg.ClientID
 
-	globalMu.Lock()
-
-	if boundClientID, ok := sessions[sessionID]; ok && boundClientID != "" {
-		targetClientID = boundClientID
-	}
-
-	client := clients[targetClientID]
-	admin := admins[sessionID]
-
-	globalMu.Unlock()
+	client, admin, targetClientID := s.sessions.resolveCommandRoute(sessionID, msg.ClientID)
 
 	logger.Websocket.Debugf(
 		"Routing %s from session_id=%s to client=%s requested_client_id=%s (cmd_id=%s)",
@@ -62,9 +53,7 @@ func (s *Server) handleCommand(msg Message) {
 func (s *Server) handleResult(msg Message) {
 	sessionID := msg.ID
 
-	globalMu.Lock()
-	admin := admins[sessionID]
-	globalMu.Unlock()
+	admin := s.sessions.getAdmin(sessionID)
 
 	logger.Websocket.Debugf(
 		"Routing %s from session_id=%s to client %s (cmd_id=%s)",
@@ -87,31 +76,27 @@ func (s *Server) handleSessionClosed(msg Message) {
 
 	sessionID := msg.ID
 
-	globalMu.Lock()
-	admin := admins[sessionID]
+	admin := s.sessions.getAdmin(sessionID)
 
 	if admin == nil {
 		logger.Websocket.Warnf(
 			"Session close requested, but admin not found: sessionID=%s",
 			sessionID,
 		)
-	} else {
-		delete(sessions, sessionID)
+		return
 	}
 
-	globalMu.Unlock()
+	s.sessions.DetachAdmin(sessionID)
 
-	if admin != nil {
-		admin.Enqueue(Message{
-			Type:  "session_closed",
-			Error: "CMD session terminated on client",
-		})
+	admin.Enqueue(Message{
+		Type:  "session_closed",
+		Error: "CMD session terminated on client",
+	})
 
-		logger.Websocket.Infof(
-			"Session closed: session_id=%s (initiated by client)",
-			sessionID,
-		)
-	}
+	logger.Websocket.Infof(
+		"Session closed: session_id=%s (initiated by client)",
+		sessionID,
+	)
 }
 
 func (s *Server) disconnect(
@@ -130,76 +115,11 @@ func (s *Server) disconnect(
 
 		if peer != nil {
 			peer.Close()
-		}
 
-		var notifications []struct {
-			peer *Peer
-			msg  Message
-		}
-
-		if peer != nil && peer.Role == "admin" {
-			globalMu.Lock()
-
-			if clientID, ok := sessions[peer.ID]; ok {
-				if client, ok := clients[clientID]; ok {
-					notifications = append(notifications, struct {
-						peer *Peer
-						msg  Message
-					}{
-						peer: client,
-						msg:  Message{Type: "admin_detach", ID: peer.ID},
-					})
-				}
-
-				delete(sessions, peer.ID)
-			}
-
-			delete(admins, peer.ID)
-
-			globalMu.Unlock()
-
+			notifications := s.sessions.RemovePeer(peer)
 			for _, n := range notifications {
-				n.peer.Enqueue(n.msg)
+				n.Peer.Enqueue(n.Msg)
 			}
-
-			logger.Websocket.Infof("Admin disconnected: %v", peer.ID)
-		}
-
-		if peer != nil && peer.Role == "client" {
-			globalMu.Lock()
-
-			if clients[peer.ID] == peer {
-				delete(clients, peer.ID)
-				logger.Websocket.Infof("Client mapping removed: %s", peer.ID)
-			}
-
-			for sessionID, clientID := range sessions {
-				if clientID == peer.ID {
-					if admin, ok := admins[sessionID]; ok {
-						notifications = append(notifications, struct {
-							peer *Peer
-							msg  Message
-						}{
-							peer: admin,
-							msg: Message{
-								Type:     "session_closed",
-								ClientID: peer.ID,
-								Error:    "Client disconnected",
-							},
-						})
-					}
-
-					delete(sessions, sessionID)
-				}
-			}
-
-			globalMu.Unlock()
-
-			for _, n := range notifications {
-				n.peer.Enqueue(n.msg)
-			}
-
-			logger.Websocket.Infof("Client disconnected: %v", peer.ID)
 		}
 
 		conn.Close()

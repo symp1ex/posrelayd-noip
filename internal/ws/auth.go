@@ -173,13 +173,9 @@ func (s *Server) handleAdminAuth(
 		return "", false
 	}
 
-	globalMu.Lock()
-	_, online := clients[msg.ClientID]
-	globalMu.Unlock()
-
-	if !online {
+	if ok := s.sessions.AttachAdminToClient(msg.ID, msg.ClientID); !ok {
 		logger.Websocket.Infof(
-			"Auth failed: client %s offline (admin=%s)",
+			"Auth failed: client %s offline (session_id=%s)",
 			msg.ClientID, msg.ID,
 		)
 		_ = conn.WriteJSON(Message{Type: "auth_fail", Error: "Client is offline"})
@@ -243,28 +239,10 @@ func (s *Server) handleAdminRegister(
 	peer.StartWriter()
 	peer.StartPing(30 * time.Second)
 
-	globalMu.Lock()
-
 	var targetClient *Peer
 
 	if peer.Role == "admin" {
-		admins[peer.ID] = peer
-
-		sessionID := msg.ID
-		client := sessions[sessionID]
-
-		if client != "" {
-			var ok bool
-			targetClient, ok = clients[client]
-			if !ok {
-				targetClient = nil
-			}
-		}
-	}
-
-	globalMu.Unlock() // <- освободили мьютекс до WriteJSON
-
-	if peer.Role == "admin" {
+		targetClient = s.sessions.RegisterAdmin(peer)
 		logger.Websocket.Infof(
 			"Admin connected: %v",
 			peer.ID,
@@ -429,7 +407,7 @@ func (s *Server) handleClientHello(
 	peer.StartWriter()
 	peer.StartPing(30 * time.Second)
 
-	if !registerClientPeer(conn, peer) {
+	if !s.registerClientPeer(conn, peer) {
 		peer.Close()
 		return nil, false
 	}
@@ -444,11 +422,10 @@ func (s *Server) handleClientHello(
 	ctx := context.Background()
 
 	if !s.issueTempPass(ctx, msg.ID, peer) {
-		globalMu.Lock()
-		if clients[peer.ID] == peer {
-			delete(clients, peer.ID)
+		notifications := s.sessions.RemovePeer(peer)
+		for _, n := range notifications {
+			n.Peer.Enqueue(n.Msg)
 		}
-		globalMu.Unlock()
 
 		peer.Close()
 		return nil, false
@@ -467,54 +444,23 @@ func (s *Server) handleClientHello(
 	return peer, true
 }
 
-func registerClientPeer(conn *websocket.Conn, newPeer *Peer) bool {
+func (s *Server) registerClientPeer(conn *websocket.Conn, newPeer *Peer) bool {
 	for attempt := 1; attempt <= duplicateClientCheckAttempts; attempt++ {
-		globalMu.Lock()
-		oldPeer := clients[newPeer.ID]
+		oldPeer, takeover, registered := s.sessions.RegisterClient(newPeer)
 
-		if oldPeer == nil {
-			clients[newPeer.ID] = newPeer
-			globalMu.Unlock()
-
-			logger.Websocket.Infof(
-				"Client registered: client_id=%s instance_id=%s legacy=%t",
-				newPeer.ID,
-				newPeer.InstanceID,
-				newPeer.InstanceID == "",
-			)
+		if registered {
+			if takeover && oldPeer != nil {
+				oldPeer.Close()
+				_ = oldPeer.Conn.Close()
+			}
 
 			return true
 		}
 
-		sameInstance :=
-			newPeer.InstanceID != "" &&
-				oldPeer.InstanceID != "" &&
-				newPeer.InstanceID == oldPeer.InstanceID
-
-		stale := time.Since(oldPeer.LastSeen()) > clientStaleAfter
-
-		if sameInstance || stale {
-			clients[newPeer.ID] = newPeer
-			globalMu.Unlock()
-
-			logger.Websocket.Warnf(
-				"Client takeover: client_id=%s same_instance=%t stale=%t old_instance_id=%s new_instance_id=%s",
-				newPeer.ID,
-				sameInstance,
-				stale,
-				oldPeer.InstanceID,
-				newPeer.InstanceID,
-			)
-
-			oldPeer.Close()
-			_ = oldPeer.Conn.Close()
-
-			return true
+		oldInstanceID := ""
+		if oldPeer != nil {
+			oldInstanceID = oldPeer.InstanceID
 		}
-
-		oldInstanceID := oldPeer.InstanceID
-		newInstanceID := newPeer.InstanceID
-		globalMu.Unlock()
 
 		logger.Websocket.Warnf(
 			"Duplicate client connection attempt %d/%d: client_id=%s old_instance_id=%s new_instance_id=%s legacy=%t",
@@ -522,7 +468,7 @@ func registerClientPeer(conn *websocket.Conn, newPeer *Peer) bool {
 			duplicateClientCheckAttempts,
 			newPeer.ID,
 			oldInstanceID,
-			newInstanceID,
+			newPeer.InstanceID,
 			newPeer.InstanceID == "",
 		)
 
