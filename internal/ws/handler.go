@@ -227,7 +227,7 @@ func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 
 			// ---------------- REGISTER ----------------
 		case "register":
-			newPeer, ok := s.handleRegister(
+			newPeer, ok := s.handleAdminRegister(
 				conn,
 				remoteIP,
 				authenticated,

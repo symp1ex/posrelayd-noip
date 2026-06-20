@@ -6,7 +6,6 @@ import (
 	"math/rand"
 	"net/http"
 	"posrelayd-noip/internal/config"
-	"strings"
 	"sync"
 	"time"
 
@@ -208,7 +207,7 @@ func (s *Server) handleAdminAuth(
 	return msg.ClientID, true
 }
 
-func (s *Server) handleRegister(
+func (s *Server) handleAdminRegister(
 	conn *websocket.Conn,
 	remoteIP string,
 	authenticated bool,
@@ -237,8 +236,7 @@ func (s *Server) handleRegister(
 	}
 
 	logger.Websocket.Infof(
-		"%s registered successfully: %s",
-		strings.Title(msg.Role),
+		"Admin registered successfully: %s",
 		msg.ID,
 	)
 
@@ -280,16 +278,6 @@ func (s *Server) handleRegister(
 			ID:   peer.ID,
 		})
 
-	} else if peer.Role == "client" {
-
-		globalMu.Lock()
-		clients[peer.ID] = peer
-		globalMu.Unlock()
-
-		logger.Websocket.Infof(
-			"Client connected: %v",
-			peer.ID,
-		)
 	}
 	return peer, true
 }
