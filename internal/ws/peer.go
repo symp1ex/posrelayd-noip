@@ -15,6 +15,7 @@ type Peer struct {
 	Role       string // "admin" or "client"
 	InstanceID string
 	Conn       *websocket.Conn
+	SessionID  string
 
 	sendQueue chan OutboundMessage
 	pingDone  chan struct{}

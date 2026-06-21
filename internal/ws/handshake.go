@@ -20,6 +20,9 @@ type handshakeState struct {
 	challenge  string
 	password   string
 	instanceID string
+	role       string
+	sessionID  string
+	token      string
 }
 
 func (s *Server) handleHandshake(r *http.Request, peerState *handshakeState, msg Message) (bool, string) {
@@ -116,6 +119,9 @@ func (s *Server) handleHandshake(r *http.Request, peerState *handshakeState, msg
 	peerState.challenge = hex.EncodeToString(chal)
 	peerState.password = msg.Password
 	peerState.instanceID = msg.InstanceID
+	peerState.role = msg.Role
+	peerState.sessionID = sessionIDFromMessage(msg)
+	peerState.token = msg.Token
 
 	logger.Websocket.Infof("Handshake: challenge prepared for client %s", msg.ID)
 
@@ -223,6 +229,14 @@ func (s *Server) handleHandshakeSign(
 			err,
 		)
 		return nil, false
+	}
+
+	if hState.role == RoleRDAgent {
+		msg.Role = RoleRDAgent
+		msg.SessionID = hState.sessionID
+		msg.Token = hState.token
+
+		return s.handleRDAgentRegister(conn, msg)
 	}
 
 	logger.Websocket.Infof("Handshake: passing client %s to hello handler", msg.ID)

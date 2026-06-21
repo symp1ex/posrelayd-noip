@@ -1,5 +1,41 @@
 package ws
 
+const (
+	RoleAdmin   = "admin"
+	RoleClient  = "client"
+	RoleRDAdmin = "rd_admin"
+	RoleRDAgent = "rd_agent"
+)
+
+const (
+	MessageAdminHello  = "admin_hello"
+	MessageClientHello = "client_hello"
+	MessageSign        = "sign"
+	MessageRegister    = "register"
+	MessageAuth        = "auth"
+	
+	MessageCommand       = "command"
+	MessageControl       = "control"
+	MessageResult        = "result"
+	MessageSessionClosed = "session_closed"
+
+	MessageRDAdminRegister = "rd_admin_register"
+	MessageRDAgentRegister = "rd_agent_register"
+	MessageRDStart         = "rd_start"
+	MessageRDStop          = "rd_stop"
+	MessageRDOffer         = "rd_offer"
+	MessageRDAnswer        = "rd_answer"
+	MessageRDIce           = "rd_ice"
+	MessageRDReady         = "rd_ready"
+	MessageRDClosed        = "rd_closed"
+	MessageRDError         = "rd_error"
+)
+
+const (
+	RDTargetAdmin = "admin"
+	RDTargetAgent = "agent"
+)
+
 type Message struct {
 	Type       string                 `json:"type"`
 	ClientID   string                 `json:"client_id,omitempty"`
@@ -11,6 +47,13 @@ type Message struct {
 	Result     map[string]interface{} `json:"result,omitempty"`
 	Role       string                 `json:"role,omitempty"`
 	ID         string                 `json:"id,omitempty"`
+
+	// === RD / WEBRTC ===
+	SessionID string `json:"session_id,omitempty"`
+	Token     string `json:"token,omitempty"`
+	Target    string `json:"target,omitempty"`
+	SDP       string `json:"sdp,omitempty"`
+	Candidate any    `json:"candidate,omitempty"`
 
 	// === AUTH ===
 	Password string `json:"password,omitempty"`

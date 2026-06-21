@@ -9,16 +9,21 @@ import (
 
 type SessionManager struct {
 	mu       sync.RWMutex
-	clients  map[string]*Peer
-	admins   map[string]*Peer
-	sessions map[string]string
+	clients  map[string]*Peer  // cmd client_id -> client peer
+	admins   map[string]*Peer  // cmd session_id -> admin peer
+	sessions map[string]string // cmd session_id -> client_id
+
+	rdAdminsBySessionID map[string]*Peer // rd session_id -> rd_admin peer
+	rdAgentsBySessionID map[string]*Peer // rd session_id -> rd_agent peer
 }
 
 func NewSessionManager() *SessionManager {
 	return &SessionManager{
-		clients:  make(map[string]*Peer),
-		admins:   make(map[string]*Peer),
-		sessions: make(map[string]string),
+		clients:             make(map[string]*Peer),
+		admins:              make(map[string]*Peer),
+		sessions:            make(map[string]string),
+		rdAdminsBySessionID: make(map[string]*Peer),
+		rdAgentsBySessionID: make(map[string]*Peer),
 	}
 }
 
@@ -145,6 +150,45 @@ func (m *SessionManager) GetAttachedClient(session_id string) (*Peer, string, bo
 	return client, clientID, true
 }
 
+func (m *SessionManager) RegisterRDAdmin(sessionID string, peer *Peer) (attachedAgent *Peer) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	peer.SessionID = sessionID
+	m.rdAdminsBySessionID[sessionID] = peer
+
+	logger.Websocket.Infof(
+		"RD admin registered: session_id=%s peer_id=%s",
+		sessionID,
+		peer.ID,
+	)
+
+	return m.rdAgentsBySessionID[sessionID]
+}
+
+func (m *SessionManager) RegisterRDAgent(sessionID string, peer *Peer) (attachedAdmin *Peer) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	peer.SessionID = sessionID
+	m.rdAgentsBySessionID[sessionID] = peer
+
+	logger.Websocket.Infof(
+		"RD agent registered: session_id=%s peer_id=%s",
+		sessionID,
+		peer.ID,
+	)
+
+	return m.rdAdminsBySessionID[sessionID]
+}
+
+func (m *SessionManager) resolveRDRoute(sessionID string) (*Peer, *Peer) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.rdAdminsBySessionID[sessionID], m.rdAgentsBySessionID[sessionID]
+}
+
 type PeerNotification struct {
 	Peer *Peer
 	Msg  Message
@@ -161,7 +205,7 @@ func (m *SessionManager) RemovePeer(peer *Peer) []PeerNotification {
 	var notifications []PeerNotification
 
 	switch peer.Role {
-	case "admin":
+	case RoleAdmin:
 		if clientID, ok := m.sessions[peer.ID]; ok {
 			if client := m.clients[clientID]; client != nil {
 				notifications = append(notifications, PeerNotification{
@@ -177,7 +221,7 @@ func (m *SessionManager) RemovePeer(peer *Peer) []PeerNotification {
 
 		logger.Websocket.Infof("Admin disconnected: %v", peer.ID)
 
-	case "client":
+	case RoleClient:
 		if m.clients[peer.ID] == peer {
 			delete(m.clients, peer.ID)
 			logger.Websocket.Infof("Client mapping removed: %s", peer.ID)
@@ -203,8 +247,55 @@ func (m *SessionManager) RemovePeer(peer *Peer) []PeerNotification {
 		}
 
 		logger.Websocket.Infof("Client disconnected: %v", peer.ID)
-	}
 
+	case RoleRDAdmin:
+		sessionID := peer.SessionID
+		if sessionID == "" {
+			sessionID = peer.ID
+		}
+
+		if m.rdAdminsBySessionID[sessionID] == peer {
+			delete(m.rdAdminsBySessionID, sessionID)
+		}
+
+		if agent := m.rdAgentsBySessionID[sessionID]; agent != nil {
+			notifications = append(notifications, PeerNotification{
+				Peer: agent,
+				Msg: Message{
+					Type:      MessageRDClosed,
+					ID:        sessionID,
+					SessionID: sessionID,
+					Error:     "RD admin disconnected",
+				},
+			})
+		}
+
+		logger.Websocket.Infof("RD admin disconnected: peer_id=%s session_id=%s", peer.ID, sessionID)
+
+	case RoleRDAgent:
+		sessionID := peer.SessionID
+		if sessionID == "" {
+			sessionID = peer.ID
+		}
+
+		if m.rdAgentsBySessionID[sessionID] == peer {
+			delete(m.rdAgentsBySessionID, sessionID)
+		}
+
+		if admin := m.rdAdminsBySessionID[sessionID]; admin != nil {
+			notifications = append(notifications, PeerNotification{
+				Peer: admin,
+				Msg: Message{
+					Type:      MessageRDClosed,
+					ID:        sessionID,
+					SessionID: sessionID,
+					Error:     "RD agent disconnected",
+				},
+			})
+		}
+
+		logger.Websocket.Infof("RD agent disconnected: peer_id=%s session_id=%s", peer.ID, sessionID)
+	}
 	return notifications
 }
 

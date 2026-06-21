@@ -145,7 +145,7 @@ func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 
 		if !authenticated {
 			switch msg.Type {
-			case "admin_hello", "client_hello", "sign":
+			case MessageAdminHello, MessageClientHello, MessageSign:
 				// разрешено
 			default:
 				protocolViolationsMu.Lock()
@@ -177,7 +177,7 @@ func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 
 		if authenticated && peer == nil {
 			switch msg.Type {
-			case "register", "auth":
+			case MessageRegister, MessageAuth, MessageRDAdminRegister, MessageRDAgentRegister:
 				// разрешено
 			default:
 				writeOrEnqueue(conn, peer, Message{
@@ -189,7 +189,7 @@ func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		switch msg.Type {
-		case "admin_hello":
+		case MessageAdminHello:
 			if !s.handleAdminHello(conn, remoteIP, msg) {
 				continue
 			}
@@ -201,7 +201,7 @@ func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 
 		// ================= AUTH =================
 
-		case "auth":
+		case MessageAuth:
 			clientID, ok := s.handleAdminAuth(
 				r,
 				conn,
@@ -225,7 +225,7 @@ func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 			protocolViolationsMu.Unlock()
 
 			// ---------------- REGISTER ----------------
-		case "register":
+		case MessageRegister:
 			newPeer, ok := s.handleAdminRegister(
 				conn,
 				remoteIP,
@@ -239,9 +239,37 @@ func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 
 			peer = newPeer
 
+		case MessageRDAdminRegister:
+			newPeer, ok := s.handleRDAdminRegister(
+				conn,
+				msg,
+			)
+
+			if !ok {
+				return
+			}
+
+			peer = newPeer
+
+		case MessageRDAgentRegister:
+			if peer != nil && peer.Role == RoleRDAgent {
+				writeOrEnqueue(conn, peer, Message{
+					Type:      MessageRDReady,
+					ID:        peer.SessionID,
+					SessionID: peer.SessionID,
+				})
+				continue
+			}
+
+			writeOrEnqueue(conn, peer, Message{
+				Type:  MessageRDError,
+				Error: "rd_agent_register requires client_hello/sign with role=rd_agent",
+			})
+			continue
+
 		// ================= CLIENT HELLO =================
 
-		case "client_hello":
+		case MessageClientHello:
 			if !s.validateClientHello(
 				conn,
 				remoteIP,
@@ -272,7 +300,7 @@ func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 				msg.ID,
 			)
 
-		case "sign":
+		case MessageSign:
 			waitingHandshakeSign = false
 			handshakeSignDeadline = time.Time{}
 			conn.SetReadDeadline(time.Now().Add(waitTimeout))
@@ -293,14 +321,24 @@ func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 
 		// ================= ROUTING =================
 
-		case "command", "control":
+		case MessageCommand, MessageControl:
 			s.handleCommand(msg)
 
-		case "result":
+		case MessageResult:
 			s.handleResult(msg)
 
-		case "session_closed":
+		case MessageSessionClosed:
 			s.handleSessionClosed(msg)
+
+		case MessageRDStart,
+			MessageRDStop,
+			MessageRDOffer,
+			MessageRDAnswer,
+			MessageRDIce,
+			MessageRDReady,
+			MessageRDClosed,
+			MessageRDError:
+			s.handleRDMessage(peer, msg)
 
 		default:
 			protocolViolationsMu.Lock()

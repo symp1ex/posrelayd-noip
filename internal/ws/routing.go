@@ -3,6 +3,7 @@ package ws
 import (
 	"github.com/gorilla/websocket"
 	"posrelayd-noip/internal/logger"
+	"time"
 )
 
 func (s *Server) handleCommand(msg Message) {
@@ -97,6 +98,189 @@ func (s *Server) handleSessionClosed(msg Message) {
 		"Session closed: session_id=%s (initiated by client)",
 		sessionID,
 	)
+}
+
+func sessionIDFromMessage(msg Message) string {
+	if msg.SessionID != "" {
+		return msg.SessionID
+	}
+
+	return msg.ID
+}
+
+func (s *Server) handleRDAdminRegister(
+	conn *websocket.Conn,
+	msg Message,
+) (*Peer, bool) {
+	sessionID := sessionIDFromMessage(msg)
+	if sessionID == "" {
+		_ = conn.WriteJSON(Message{
+			Type:  MessageRDError,
+			Error: "session_id is required",
+		})
+		return nil, false
+	}
+
+	peerID := msg.ID
+	if peerID == "" {
+		peerID = sessionID
+	}
+
+	peer := &Peer{
+		ID:        peerID,
+		Role:      RoleRDAdmin,
+		Conn:      conn,
+		SessionID: sessionID,
+		sendQueue: make(chan OutboundMessage, 256),
+		done:      make(chan struct{}),
+		lastSeen:  time.Now(),
+	}
+
+	peer.StartWriter()
+	peer.StartPing(30 * time.Second)
+
+	agent := s.sessions.RegisterRDAdmin(sessionID, peer)
+
+	logger.Websocket.Infof(
+		"RD admin connected: peer_id=%s session_id=%s",
+		peer.ID,
+		sessionID,
+	)
+
+	peer.Enqueue(Message{
+		Type:      MessageRDReady,
+		ID:        sessionID,
+		SessionID: sessionID,
+	})
+
+	if agent != nil {
+		agent.Enqueue(Message{
+			Type:      MessageRDReady,
+			ID:        sessionID,
+			SessionID: sessionID,
+		})
+	}
+
+	return peer, true
+}
+
+func (s *Server) handleRDAgentRegister(
+	conn *websocket.Conn,
+	msg Message,
+) (*Peer, bool) {
+	sessionID := sessionIDFromMessage(msg)
+	if sessionID == "" {
+		_ = conn.WriteJSON(Message{
+			Type:  MessageRDError,
+			Error: "session_id is required",
+		})
+		return nil, false
+	}
+
+	peerID := msg.ID
+	if peerID == "" {
+		peerID = sessionID
+	}
+
+	peer := &Peer{
+		ID:         peerID,
+		Role:       RoleRDAgent,
+		InstanceID: msg.InstanceID,
+		Conn:       conn,
+		SessionID:  sessionID,
+		sendQueue:  make(chan OutboundMessage, 256),
+		done:       make(chan struct{}),
+		lastSeen:   time.Now(),
+	}
+
+	peer.StartWriter()
+	peer.StartPing(30 * time.Second)
+
+	admin := s.sessions.RegisterRDAgent(sessionID, peer)
+
+	logger.Websocket.Infof(
+		"RD agent connected: peer_id=%s session_id=%s",
+		peer.ID,
+		sessionID,
+	)
+
+	peer.Enqueue(Message{
+		Type:      MessageRDReady,
+		ID:        sessionID,
+		SessionID: sessionID,
+	})
+
+	if admin != nil {
+		admin.Enqueue(Message{
+			Type:      MessageRDReady,
+			ID:        sessionID,
+			SessionID: sessionID,
+		})
+	}
+
+	return peer, true
+}
+
+func (s *Server) handleRDMessage(from *Peer, msg Message) {
+	if from == nil || (from.Role != RoleRDAdmin && from.Role != RoleRDAgent) {
+		logger.Websocket.Warnf(
+			"RD routing rejected: peer is not registered as RD peer type=%s",
+			msg.Type,
+		)
+		return
+	}
+
+	sessionID := sessionIDFromMessage(msg)
+	if sessionID == "" {
+		sessionID = from.SessionID
+	}
+
+	if sessionID == "" {
+		from.Enqueue(Message{
+			Type:  MessageRDError,
+			Error: "session_id is required",
+		})
+		return
+	}
+
+	admin, agent := s.sessions.resolveRDRoute(sessionID)
+
+	var target *Peer
+	switch msg.Target {
+	case RDTargetAdmin:
+		target = admin
+	case RDTargetAgent:
+		target = agent
+	default:
+		if from.Role == RoleRDAdmin {
+			target = agent
+		} else {
+			target = admin
+		}
+	}
+
+	if target == nil {
+		logger.Websocket.Warnf(
+			"RD routing dropped: target not found type=%s from_role=%s session_id=%s target=%s",
+			msg.Type,
+			from.Role,
+			sessionID,
+			msg.Target,
+		)
+
+		from.Enqueue(Message{
+			Type:      MessageRDError,
+			ID:        sessionID,
+			SessionID: sessionID,
+			Error:     "RD target is offline or not registered",
+		})
+		return
+	}
+
+	msg.ID = sessionID
+	msg.SessionID = sessionID
+
+	target.Enqueue(msg)
 }
 
 func (s *Server) disconnect(
