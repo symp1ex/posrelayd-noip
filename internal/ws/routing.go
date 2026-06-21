@@ -77,6 +77,9 @@ func (s *Server) handleSessionClosed(msg Message) {
 
 	sessionID := msg.ID
 
+	_, clientID, _ := s.sessions.GetAttachedClient(sessionID)
+	s.cleanupRDSession(sessionID, clientID, "CMD session terminated on client")
+
 	admin := s.sessions.getAdmin(sessionID)
 
 	if admin == nil {
@@ -106,6 +109,48 @@ func sessionIDFromMessage(msg Message) string {
 	}
 
 	return msg.ID
+}
+
+func (s *Server) cleanupRDSession(sessionID string, clientID string, reason string) {
+	s.sessions.RevokeRDTokensBySession(sessionID)
+
+	rdAdmin, rdAgent := s.sessions.CleanupRDSession(sessionID)
+
+	if clientID == "" {
+		_, attachedClientID, ok := s.sessions.GetAttachedClient(sessionID)
+		if ok {
+			clientID = attachedClientID
+		}
+	}
+
+	if client, _, ok := s.sessions.GetAttachedClient(sessionID); ok && client != nil {
+		client.Enqueue(Message{
+			Type:      MessageRDAgentStop,
+			ID:        sessionID,
+			SessionID: sessionID,
+			ClientID:  clientID,
+		})
+	}
+
+	if rdAdmin != nil {
+		rdAdmin.Enqueue(Message{
+			Type:      MessageRDClosed,
+			ID:        sessionID,
+			SessionID: sessionID,
+			ClientID:  clientID,
+			Error:     reason,
+		})
+	}
+
+	if rdAgent != nil {
+		rdAgent.Enqueue(Message{
+			Type:      MessageRDClosed,
+			ID:        sessionID,
+			SessionID: sessionID,
+			ClientID:  clientID,
+			Error:     reason,
+		})
+	}
 }
 
 func (s *Server) handleRDAdminRegister(
@@ -177,6 +222,54 @@ func (s *Server) handleRDAgentRegister(
 		return nil, false
 	}
 
+	if msg.Token == "" {
+		_ = conn.WriteJSON(Message{
+			Type:      MessageRDError,
+			ID:        sessionID,
+			SessionID: sessionID,
+			Error:     "rd token is required",
+		})
+		return nil, false
+	}
+
+	_, attachedClientID, ok := s.sessions.GetAttachedClient(sessionID)
+	if !ok {
+		_ = conn.WriteJSON(Message{
+			Type:      MessageRDError,
+			ID:        sessionID,
+			SessionID: sessionID,
+			Error:     "cmd session is not attached or client is offline",
+		})
+		return nil, false
+	}
+
+	clientID := msg.ClientID
+	if clientID == "" {
+		clientID = msg.ID
+	}
+
+	if clientID != attachedClientID {
+		_ = conn.WriteJSON(Message{
+			Type:      MessageRDError,
+			ID:        sessionID,
+			SessionID: sessionID,
+			ClientID:  clientID,
+			Error:     "client_id does not match attached cmd session",
+		})
+		return nil, false
+	}
+
+	if !s.sessions.ConsumeRDToken(msg.Token, sessionID, clientID) {
+		_ = conn.WriteJSON(Message{
+			Type:      MessageRDError,
+			ID:        sessionID,
+			SessionID: sessionID,
+			ClientID:  clientID,
+			Error:     "invalid, expired, or already consumed rd token",
+		})
+		return nil, false
+	}
+
 	peerID := msg.ID
 	if peerID == "" {
 		peerID = sessionID
@@ -199,15 +292,17 @@ func (s *Server) handleRDAgentRegister(
 	admin := s.sessions.RegisterRDAgent(sessionID, peer)
 
 	logger.Websocket.Infof(
-		"RD agent connected: peer_id=%s session_id=%s",
+		"RD agent connected: peer_id=%s session_id=%s client_id=%s",
 		peer.ID,
 		sessionID,
+		clientID,
 	)
 
 	peer.Enqueue(Message{
 		Type:      MessageRDReady,
 		ID:        sessionID,
 		SessionID: sessionID,
+		ClientID:  clientID,
 	})
 
 	if admin != nil {
@@ -215,6 +310,7 @@ func (s *Server) handleRDAgentRegister(
 			Type:      MessageRDReady,
 			ID:        sessionID,
 			SessionID: sessionID,
+			ClientID:  clientID,
 		})
 	}
 
@@ -222,6 +318,15 @@ func (s *Server) handleRDAgentRegister(
 }
 
 func (s *Server) handleRDMessage(from *Peer, msg Message) {
+	switch msg.Type {
+	case MessageRDStart:
+		s.handleRDStart(from, msg)
+		return
+
+	case MessageRDStop:
+		s.handleRDStop(from, msg)
+		return
+	}
 	if from == nil || (from.Role != RoleRDAdmin && from.Role != RoleRDAgent) {
 		logger.Websocket.Warnf(
 			"RD routing rejected: peer is not registered as RD peer type=%s",
@@ -281,6 +386,139 @@ func (s *Server) handleRDMessage(from *Peer, msg Message) {
 	msg.SessionID = sessionID
 
 	target.Enqueue(msg)
+}
+
+func (s *Server) handleRDStart(from *Peer, msg Message) {
+	if from == nil || from.Role != RoleRDAdmin {
+		logger.Websocket.Warnf(
+			"RD start rejected: sender is not rd_admin",
+		)
+		return
+	}
+
+	sessionID := sessionIDFromMessage(msg)
+	if sessionID == "" {
+		from.Enqueue(Message{
+			Type:  MessageRDError,
+			Error: "session_id is required",
+		})
+		return
+	}
+
+	client, attachedClientID, ok := s.sessions.GetAttachedClient(sessionID)
+	if !ok || client == nil {
+		from.Enqueue(Message{
+			Type:      MessageRDError,
+			ID:        sessionID,
+			SessionID: sessionID,
+			Error:     "cmd session is not attached or client is offline",
+		})
+		return
+	}
+
+	clientID := msg.ClientID
+	if clientID == "" {
+		clientID = attachedClientID
+	}
+
+	if clientID != attachedClientID {
+		from.Enqueue(Message{
+			Type:      MessageRDError,
+			ID:        sessionID,
+			SessionID: sessionID,
+			ClientID:  clientID,
+			Error:     "client_id does not match attached cmd session",
+		})
+		return
+	}
+
+	if s.sessions.HasActiveRDAgent(sessionID) {
+		from.Enqueue(Message{
+			Type:      MessageRDError,
+			ID:        sessionID,
+			SessionID: sessionID,
+			ClientID:  clientID,
+			Error:     "rd-agent is already active for this session",
+		})
+		return
+	}
+
+	token, expiresAt, err := s.sessions.CreateRDToken(sessionID, clientID, rdTokenTTL)
+	if err != nil {
+		from.Enqueue(Message{
+			Type:      MessageRDError,
+			ID:        sessionID,
+			SessionID: sessionID,
+			ClientID:  clientID,
+			Error:     err.Error(),
+		})
+		return
+	}
+
+	client.Enqueue(Message{
+		Type:      MessageRDAgentStart,
+		ID:        sessionID,
+		SessionID: sessionID,
+		ClientID:  clientID,
+		Token:     token,
+		ExpiresAt: expiresAt.Format(time.RFC3339Nano),
+	})
+
+	from.Enqueue(Message{
+		Type:      MessageRDStart,
+		ID:        sessionID,
+		SessionID: sessionID,
+		ClientID:  clientID,
+		ExpiresAt: expiresAt.Format(time.RFC3339Nano),
+	})
+
+	logger.Websocket.Infof(
+		"RD agent start requested: session_id=%s client_id=%s expires_at=%s",
+		sessionID,
+		clientID,
+		expiresAt.Format(time.RFC3339Nano),
+	)
+}
+
+func (s *Server) handleRDStop(from *Peer, msg Message) {
+	if from == nil || from.Role != RoleRDAdmin {
+		logger.Websocket.Warnf(
+			"RD stop rejected: sender is not rd_admin",
+		)
+		return
+	}
+
+	sessionID := sessionIDFromMessage(msg)
+	if sessionID == "" {
+		from.Enqueue(Message{
+			Type:  MessageRDError,
+			Error: "session_id is required",
+		})
+		return
+	}
+
+	clientID := msg.ClientID
+	if _, attachedClientID, ok := s.sessions.GetAttachedClient(sessionID); ok {
+		if clientID == "" {
+			clientID = attachedClientID
+		}
+	}
+
+	s.cleanupRDSession(sessionID, clientID, "RD stopped by admin")
+
+	from.Enqueue(Message{
+		Type:      MessageRDClosed,
+		ID:        sessionID,
+		SessionID: sessionID,
+		ClientID:  clientID,
+		Error:     "RD stopped by admin",
+	})
+
+	logger.Websocket.Infof(
+		"RD stop requested: session_id=%s client_id=%s",
+		sessionID,
+		clientID,
+	)
 }
 
 func (s *Server) disconnect(

@@ -1,11 +1,25 @@
 package ws
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
+	"errors"
 	"sync"
 	"time"
 
 	"posrelayd-noip/internal/logger"
 )
+
+const rdTokenTTL = 60 * time.Second
+
+type rdTokenEntry struct {
+	tokenHash [32]byte
+	sessionID string
+	clientID  string
+	expiresAt time.Time
+}
 
 type SessionManager struct {
 	mu       sync.RWMutex
@@ -13,8 +27,9 @@ type SessionManager struct {
 	admins   map[string]*Peer  // cmd session_id -> admin peer
 	sessions map[string]string // cmd session_id -> client_id
 
-	rdAdminsBySessionID map[string]*Peer // rd session_id -> rd_admin peer
-	rdAgentsBySessionID map[string]*Peer // rd session_id -> rd_agent peer
+	rdAdminsBySessionID map[string]*Peer         // rd session_id -> rd_admin peer
+	rdAgentsBySessionID map[string]*Peer         // rd session_id -> rd_agent peer
+	rdTokensByHash      map[string]*rdTokenEntry // sha256(token) base64url -> token metadata
 }
 
 func NewSessionManager() *SessionManager {
@@ -24,7 +39,219 @@ func NewSessionManager() *SessionManager {
 		sessions:            make(map[string]string),
 		rdAdminsBySessionID: make(map[string]*Peer),
 		rdAgentsBySessionID: make(map[string]*Peer),
+		rdTokensByHash:      make(map[string]*rdTokenEntry),
 	}
+}
+
+func hashRDToken(token string) ([32]byte, string) {
+	hash := sha256.Sum256([]byte(token))
+	key := base64.RawURLEncoding.EncodeToString(hash[:])
+	return hash, key
+}
+
+func (m *SessionManager) CreateRDToken(
+	sessionID string,
+	clientID string,
+	ttl time.Duration,
+) (plainToken string, expiresAt time.Time, err error) {
+	if sessionID == "" {
+		return "", time.Time{}, errors.New("session_id is required")
+	}
+
+	if clientID == "" {
+		return "", time.Time{}, errors.New("client_id is required")
+	}
+
+	if ttl <= 0 {
+		ttl = rdTokenTTL
+	}
+
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", time.Time{}, err
+	}
+
+	plainToken = base64.RawURLEncoding.EncodeToString(raw)
+	tokenHash, tokenKey := hashRDToken(plainToken)
+	expiresAt = time.Now().UTC().Add(ttl)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	attachedClientID, ok := m.sessions[sessionID]
+	if !ok || attachedClientID == "" {
+		return "", time.Time{}, errors.New("cmd session is not attached")
+	}
+
+	if attachedClientID != clientID {
+		return "", time.Time{}, errors.New("client_id does not match attached cmd session")
+	}
+
+	if m.clients[clientID] == nil {
+		return "", time.Time{}, errors.New("attached client is offline")
+	}
+
+	m.rdTokensByHash[tokenKey] = &rdTokenEntry{
+		tokenHash: tokenHash,
+		sessionID: sessionID,
+		clientID:  clientID,
+		expiresAt: expiresAt,
+	}
+
+	logger.Websocket.Infof(
+		"RD token created: session_id=%s client_id=%s expires_at=%s",
+		sessionID,
+		clientID,
+		expiresAt.Format(time.RFC3339Nano),
+	)
+
+	return plainToken, expiresAt, nil
+}
+
+func (m *SessionManager) ConsumeRDToken(
+	token string,
+	sessionID string,
+	clientID string,
+) bool {
+	if token == "" || sessionID == "" || clientID == "" {
+		return false
+	}
+
+	tokenHash, tokenKey := hashRDToken(token)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	entry := m.rdTokensByHash[tokenKey]
+	if entry == nil {
+		return false
+	}
+
+	defer delete(m.rdTokensByHash, tokenKey)
+
+	if subtle.ConstantTimeCompare(entry.tokenHash[:], tokenHash[:]) != 1 {
+		return false
+	}
+
+	if time.Now().UTC().After(entry.expiresAt) {
+		logger.Websocket.Warnf(
+			"RD token expired: session_id=%s client_id=%s",
+			sessionID,
+			clientID,
+		)
+		return false
+	}
+
+	if entry.sessionID != sessionID {
+		logger.Websocket.Warnf(
+			"RD token rejected: wrong session_id requested=%s expected=%s client_id=%s",
+			sessionID,
+			entry.sessionID,
+			clientID,
+		)
+		return false
+	}
+
+	if entry.clientID != clientID {
+		logger.Websocket.Warnf(
+			"RD token rejected: wrong client_id requested=%s expected=%s session_id=%s",
+			clientID,
+			entry.clientID,
+			sessionID,
+		)
+		return false
+	}
+
+	attachedClientID, ok := m.sessions[sessionID]
+	if !ok || attachedClientID != clientID {
+		logger.Websocket.Warnf(
+			"RD token rejected: cmd session is not attached anymore session_id=%s client_id=%s",
+			sessionID,
+			clientID,
+		)
+		return false
+	}
+
+	if m.clients[clientID] == nil {
+		logger.Websocket.Warnf(
+			"RD token rejected: attached client is offline session_id=%s client_id=%s",
+			sessionID,
+			clientID,
+		)
+		return false
+	}
+
+	logger.Websocket.Infof(
+		"RD token consumed: session_id=%s client_id=%s",
+		sessionID,
+		clientID,
+	)
+
+	return true
+}
+
+func (m *SessionManager) RevokeRDTokensBySession(sessionID string) {
+	if sessionID == "" {
+		return
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	revoked := 0
+	for tokenKey, entry := range m.rdTokensByHash {
+		if entry.sessionID == sessionID {
+			delete(m.rdTokensByHash, tokenKey)
+			revoked++
+		}
+	}
+
+	if revoked > 0 {
+		logger.Websocket.Infof(
+			"RD tokens revoked: session_id=%s count=%d",
+			sessionID,
+			revoked,
+		)
+	}
+}
+
+func (m *SessionManager) HasActiveRDAgent(sessionID string) bool {
+	if sessionID == "" {
+		return false
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.rdAgentsBySessionID[sessionID] != nil
+}
+
+func (m *SessionManager) CleanupRDSession(sessionID string) (admin *Peer, agent *Peer) {
+	if sessionID == "" {
+		return nil, nil
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	admin = m.rdAdminsBySessionID[sessionID]
+	agent = m.rdAgentsBySessionID[sessionID]
+
+	delete(m.rdAdminsBySessionID, sessionID)
+	delete(m.rdAgentsBySessionID, sessionID)
+
+	for tokenKey, entry := range m.rdTokensByHash {
+		if entry.sessionID == sessionID {
+			delete(m.rdTokensByHash, tokenKey)
+		}
+	}
+
+	logger.Websocket.Infof(
+		"RD session cleaned up: session_id=%s",
+		sessionID,
+	)
+
+	return admin, agent
 }
 
 func (m *SessionManager) RegisterClient(newPeer *Peer) (oldPeer *Peer, takeover bool, registered bool) {
@@ -124,6 +351,15 @@ func (m *SessionManager) DetachAdmin(session_id string) (client *Peer, detached 
 	client = m.clients[clientID]
 	delete(m.sessions, session_id)
 
+	for tokenKey, entry := range m.rdTokensByHash {
+		if entry.sessionID == session_id {
+			delete(m.rdTokensByHash, tokenKey)
+		}
+	}
+
+	delete(m.rdAdminsBySessionID, session_id)
+	delete(m.rdAgentsBySessionID, session_id)
+
 	logger.Websocket.Infof(
 		"Admin detached: session_id=%s client=%s",
 		session_id,
@@ -213,6 +449,52 @@ func (m *SessionManager) RemovePeer(peer *Peer) []PeerNotification {
 					Msg:  Message{Type: "admin_detach", ID: peer.ID},
 				})
 			}
+			for tokenKey, entry := range m.rdTokensByHash {
+				if entry.sessionID == peer.ID {
+					delete(m.rdTokensByHash, tokenKey)
+				}
+			}
+
+			if client := m.clients[clientID]; client != nil {
+				notifications = append(notifications, PeerNotification{
+					Peer: client,
+					Msg: Message{
+						Type:      MessageRDAgentStop,
+						ID:        peer.ID,
+						SessionID: peer.ID,
+						ClientID:  clientID,
+					},
+				})
+			}
+
+			if rdAdmin := m.rdAdminsBySessionID[peer.ID]; rdAdmin != nil {
+				notifications = append(notifications, PeerNotification{
+					Peer: rdAdmin,
+					Msg: Message{
+						Type:      MessageRDClosed,
+						ID:        peer.ID,
+						SessionID: peer.ID,
+						ClientID:  clientID,
+						Error:     "CMD admin disconnected",
+					},
+				})
+			}
+
+			if rdAgent := m.rdAgentsBySessionID[peer.ID]; rdAgent != nil {
+				notifications = append(notifications, PeerNotification{
+					Peer: rdAgent,
+					Msg: Message{
+						Type:      MessageRDClosed,
+						ID:        peer.ID,
+						SessionID: peer.ID,
+						ClientID:  clientID,
+						Error:     "CMD admin disconnected",
+					},
+				})
+			}
+
+			delete(m.rdAdminsBySessionID, peer.ID)
+			delete(m.rdAgentsBySessionID, peer.ID)
 
 			delete(m.sessions, peer.ID)
 		}
@@ -243,6 +525,40 @@ func (m *SessionManager) RemovePeer(peer *Peer) []PeerNotification {
 				})
 			}
 
+			for tokenKey, entry := range m.rdTokensByHash {
+				if entry.sessionID == sessionID {
+					delete(m.rdTokensByHash, tokenKey)
+				}
+			}
+
+			if rdAdmin := m.rdAdminsBySessionID[sessionID]; rdAdmin != nil {
+				notifications = append(notifications, PeerNotification{
+					Peer: rdAdmin,
+					Msg: Message{
+						Type:      MessageRDClosed,
+						ID:        sessionID,
+						SessionID: sessionID,
+						ClientID:  peer.ID,
+						Error:     "Client disconnected",
+					},
+				})
+			}
+
+			if rdAgent := m.rdAgentsBySessionID[sessionID]; rdAgent != nil {
+				notifications = append(notifications, PeerNotification{
+					Peer: rdAgent,
+					Msg: Message{
+						Type:      MessageRDClosed,
+						ID:        sessionID,
+						SessionID: sessionID,
+						ClientID:  peer.ID,
+						Error:     "Client disconnected",
+					},
+				})
+			}
+
+			delete(m.rdAdminsBySessionID, sessionID)
+			delete(m.rdAgentsBySessionID, sessionID)
 			delete(m.sessions, sessionID)
 		}
 
@@ -256,6 +572,26 @@ func (m *SessionManager) RemovePeer(peer *Peer) []PeerNotification {
 
 		if m.rdAdminsBySessionID[sessionID] == peer {
 			delete(m.rdAdminsBySessionID, sessionID)
+		}
+
+		for tokenKey, entry := range m.rdTokensByHash {
+			if entry.sessionID == sessionID {
+				delete(m.rdTokensByHash, tokenKey)
+			}
+		}
+
+		if clientID := m.sessions[sessionID]; clientID != "" {
+			if client := m.clients[clientID]; client != nil {
+				notifications = append(notifications, PeerNotification{
+					Peer: client,
+					Msg: Message{
+						Type:      MessageRDAgentStop,
+						ID:        sessionID,
+						SessionID: sessionID,
+						ClientID:  clientID,
+					},
+				})
+			}
 		}
 
 		if agent := m.rdAgentsBySessionID[sessionID]; agent != nil {

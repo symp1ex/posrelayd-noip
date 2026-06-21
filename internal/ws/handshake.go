@@ -235,6 +235,7 @@ func (s *Server) handleHandshakeSign(
 		msg.Role = RoleRDAgent
 		msg.SessionID = hState.sessionID
 		msg.Token = hState.token
+		msg.ClientID = hState.clientID
 
 		return s.handleRDAgentRegister(conn, msg)
 	}

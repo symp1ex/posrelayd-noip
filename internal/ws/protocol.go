@@ -13,7 +13,7 @@ const (
 	MessageSign        = "sign"
 	MessageRegister    = "register"
 	MessageAuth        = "auth"
-	
+
 	MessageCommand       = "command"
 	MessageControl       = "control"
 	MessageResult        = "result"
@@ -23,6 +23,8 @@ const (
 	MessageRDAgentRegister = "rd_agent_register"
 	MessageRDStart         = "rd_start"
 	MessageRDStop          = "rd_stop"
+	MessageRDAgentStart    = "rd_agent_start"
+	MessageRDAgentStop     = "rd_agent_stop"
 	MessageRDOffer         = "rd_offer"
 	MessageRDAnswer        = "rd_answer"
 	MessageRDIce           = "rd_ice"
@@ -51,6 +53,7 @@ type Message struct {
 	// === RD / WEBRTC ===
 	SessionID string `json:"session_id,omitempty"`
 	Token     string `json:"token,omitempty"`
+	ExpiresAt string `json:"expires_at,omitempty"`
 	Target    string `json:"target,omitempty"`
 	SDP       string `json:"sdp,omitempty"`
 	Candidate any    `json:"candidate,omitempty"`
