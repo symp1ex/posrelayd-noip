@@ -289,7 +289,7 @@ func (s *Server) handleRDAgentRegister(
 	peer.StartWriter()
 	peer.StartPing(30 * time.Second)
 
-	admin := s.sessions.RegisterRDAgent(sessionID, peer)
+	rdAdmin := s.sessions.RegisterRDAgent(sessionID, peer)
 
 	logger.Websocket.Infof(
 		"RD agent connected: peer_id=%s session_id=%s client_id=%s",
@@ -303,14 +303,21 @@ func (s *Server) handleRDAgentRegister(
 		ID:        sessionID,
 		SessionID: sessionID,
 		ClientID:  clientID,
+		Target:    RDTargetAgent,
 	})
 
-	if admin != nil {
-		admin.Enqueue(Message{
+	notifyAdmin := rdAdmin
+	if notifyAdmin == nil {
+		notifyAdmin = s.sessions.getAdmin(sessionID)
+	}
+
+	if notifyAdmin != nil {
+		notifyAdmin.Enqueue(Message{
 			Type:      MessageRDReady,
 			ID:        sessionID,
 			SessionID: sessionID,
 			ClientID:  clientID,
+			Target:    RDTargetAgent,
 		})
 	}
 
@@ -349,6 +356,10 @@ func (s *Server) handleRDMessage(from *Peer, msg Message) {
 	}
 
 	admin, agent := s.sessions.resolveRDRoute(sessionID)
+
+	if admin == nil {
+		admin = s.sessions.getAdmin(sessionID)
+	}
 
 	var target *Peer
 	switch msg.Target {
@@ -389,9 +400,15 @@ func (s *Server) handleRDMessage(from *Peer, msg Message) {
 }
 
 func (s *Server) handleRDStart(from *Peer, msg Message) {
-	if from == nil || from.Role != RoleRDAdmin {
+	if from == nil || (from.Role != RoleRDAdmin && from.Role != RoleAdmin) {
 		logger.Websocket.Warnf(
-			"RD start rejected: sender is not rd_admin",
+			"RD start rejected: sender role is not allowed role=%v",
+			func() string {
+				if from == nil {
+					return "<nil>"
+				}
+				return from.Role
+			}(),
 		)
 		return
 	}
@@ -469,6 +486,7 @@ func (s *Server) handleRDStart(from *Peer, msg Message) {
 		ID:        sessionID,
 		SessionID: sessionID,
 		ClientID:  clientID,
+		Target:    RDTargetAgent,
 		ExpiresAt: expiresAt.Format(time.RFC3339Nano),
 	})
 

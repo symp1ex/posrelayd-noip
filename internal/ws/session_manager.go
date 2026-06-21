@@ -618,9 +618,14 @@ func (m *SessionManager) RemovePeer(peer *Peer) []PeerNotification {
 			delete(m.rdAgentsBySessionID, sessionID)
 		}
 
-		if admin := m.rdAdminsBySessionID[sessionID]; admin != nil {
+		notifyAdmin := m.rdAdminsBySessionID[sessionID]
+		if notifyAdmin == nil {
+			notifyAdmin = m.admins[sessionID]
+		}
+
+		if notifyAdmin != nil {
 			notifications = append(notifications, PeerNotification{
-				Peer: admin,
+				Peer: notifyAdmin,
 				Msg: Message{
 					Type:      MessageRDClosed,
 					ID:        sessionID,
@@ -629,7 +634,7 @@ func (m *SessionManager) RemovePeer(peer *Peer) []PeerNotification {
 				},
 			})
 		}
-
+		
 		logger.Websocket.Infof("RD agent disconnected: peer_id=%s session_id=%s", peer.ID, sessionID)
 	}
 	return notifications
