@@ -51,12 +51,13 @@ type Message struct {
 	ID         string                 `json:"id,omitempty"`
 
 	// === RD / WEBRTC ===
-	SessionID string `json:"session_id,omitempty"`
-	Token     string `json:"token,omitempty"`
-	ExpiresAt string `json:"expires_at,omitempty"`
-	Target    string `json:"target,omitempty"`
-	SDP       string `json:"sdp,omitempty"`
-	Candidate any    `json:"candidate,omitempty"`
+	SessionID string        `json:"session_id,omitempty"`
+	Token     string        `json:"token,omitempty"`
+	ExpiresAt string        `json:"expires_at,omitempty"`
+	Target    string        `json:"target,omitempty"`
+	Display   DisplayConfig `json:"display,omitempty"`
+	SDP       string        `json:"sdp,omitempty"`
+	Candidate any           `json:"candidate,omitempty"`
 
 	// === AUTH ===
 	Password string `json:"password,omitempty"`
@@ -71,6 +72,11 @@ type Message struct {
 	Challenge   string `json:"challenge,omitempty"`
 	Answer      any    `json:"answer,omitempty"` // Может быть string ("ok", "fail" etc)
 	Description string `json:"description,omitempty"`
+}
+
+type DisplayConfig struct {
+	Quality string `json:"quality,omitempty"`
+	Codec   string `json:"codec,omitempty"`
 }
 
 type OutboundMessage struct {
