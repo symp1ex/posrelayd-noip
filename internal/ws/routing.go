@@ -493,12 +493,11 @@ func (s *Server) handleRDStart(from *Peer, msg Message) {
 	})
 
 	logger.Websocket.Infof(
-		"RD agent start requested: session_id=%s client_id=%s expires_at=%s display_quality=%s display_codec=%s",
+		"RD agent start requested: session_id=%s client_id=%s expires_at=%s display=%s",
 		sessionID,
 		clientID,
 		expiresAt.Format(time.RFC3339Nano),
-		msg.Display.Quality,
-		msg.Display.Codec,
+		string(msg.Display),
 	)
 }
 
